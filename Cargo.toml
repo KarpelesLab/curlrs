@@ -19,8 +19,29 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 name = "rsurl"
 path = "src/bin/rsurl.rs"
 
+[features]
+# Default keeps the historical behaviour: a single TLS backend layered on
+# purecrypto, no extra C-free guarantees lost.
+default = ["purecrypto-tls"]
+# Use purecrypto's TLS stack (purecrypto::tls). No additional deps.
+purecrypto-tls = []
+# Use rustls 0.23 + ring instead. Enable with
+#   --no-default-features --features rustls-tls
+# When both `purecrypto-tls` and `rustls-tls` are active, rustls wins (see
+# the cfg cascade in src/tls/mod.rs). HTTP/3 always uses purecrypto's TLS
+# regardless of this feature, because the QUIC stack is bound to it.
+rustls-tls = ["dep:rustls", "dep:rustls-pemfile"]
+
 [dependencies]
+# Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
+# parsing for verbose cert display, and the QUIC stack behind HTTP/3.
 purecrypto = "0.2"
+# rustls-tls backend. `ring` is selected explicitly so cross-platform builds
+# don't pull in cmake/nasm (which the default `aws-lc-rs` provider needs on
+# Windows). `tls12` is opt-in in rustls 0.23; we want it on for parity with
+# the purecrypto backend.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-pemfile = { version = "2", optional = true }
 
 [profile.release]
 lto = "thin"

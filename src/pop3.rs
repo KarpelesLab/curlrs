@@ -30,7 +30,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     let tcp = TcpStream::connect((url.host.as_str(), url.port))?;
     if url.is_tls() {
         let tls = connect_over(tcp, &url.host)?;
-        let mut session = Session::new(BufReader::new(IoAdapter::Tls(tls)));
+        let mut session = Session::new(BufReader::new(IoAdapter::Tls(Box::new(tls))));
         run(&mut session, user, pass, action)
     } else {
         let mut session = Session::new(BufReader::new(IoAdapter::Plain(tcp)));
@@ -97,9 +97,12 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
 
 /// Read+Write transport, either plain or TLS-wrapped. Enum keeps the rest
 /// of the protocol code monomorphic and lets us treat both legs the same.
+/// `Tls` is boxed because the active TLS backend can be either purecrypto
+/// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
+/// mismatch against the bare `TcpStream` arm.
 enum IoAdapter {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl Read for IoAdapter {

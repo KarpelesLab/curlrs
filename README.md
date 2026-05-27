@@ -102,6 +102,17 @@ cargo build --release
 # C header:     include/rsurl.h
 ```
 
+### TLS backend
+
+`rsurl` ships with two interchangeable TLS backends, selected at compile
+time via Cargo features. The default is `purecrypto-tls`, which keeps the
+"pure-Rust, zero C deps" promise; opt in to `rustls-tls` with
+`cargo build --release --no-default-features --features rustls-tls` to use
+rustls 0.23 + `ring` instead. The public API across `rsurl::tls` is
+identical between backends, so consumer code does not change. HTTP/3
+always uses purecrypto's TLS regardless of this feature, because the QUIC
+stack it sits on is part of `purecrypto`.
+
 ## License
 
 MIT — Copyright © 2026 Karpelès Lab Inc. See [LICENSE](LICENSE).

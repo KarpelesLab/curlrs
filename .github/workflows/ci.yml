@@ -13,12 +13,21 @@ env:
 
 jobs:
   test:
-    name: Test & lint (${{ matrix.os }})
+    name: Test & lint (${{ matrix.os }}, ${{ matrix.backend.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # Two TLS backends ship in the crate (purecrypto-tls is the default,
+        # rustls-tls is opt-in). Build & test both on every PR so neither
+        # rots. The flags are stored on the matrix entry to keep the steps
+        # below shell-portable across Linux/macOS/Windows runners.
+        backend:
+          - name: default
+            flags: --all-features
+          - name: rustls
+            flags: --no-default-features --features rustls-tls
     steps:
       - uses: actions/checkout@v6
 
@@ -30,21 +39,22 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}
+          key: ${{ matrix.os }}-${{ matrix.backend.name }}
 
       - name: Format
-        if: runner.os == 'Linux' # formatting is platform-independent
+        # Formatting is platform- and backend-independent; only run it once.
+        if: runner.os == 'Linux' && matrix.backend.name == 'default'
         run: cargo fmt --all --check
 
-      - name: Clippy (all features, warnings denied)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets ${{ matrix.backend.flags }} -- -D warnings
 
-      - name: Test (all features, release)
+      - name: Test (release)
         # `--release` so the integration tests in tests/ (which spin up a
         # local HTTP/1.1 server and round-trip real bytes through rsurl)
         # exercise the same code paths CI ships. The unit tests are cheap
         # enough that running them in release adds no meaningful time.
-        run: cargo test --release --all-features
+        run: cargo test --release ${{ matrix.backend.flags }}
 
   c_abi:
     name: C ABI smoke test
