@@ -57,6 +57,64 @@ pub struct Request {
     /// `--max-time`. `None` means no cap beyond `connect_timeout` /
     /// `read_timeout`.
     pub(crate) max_time: Option<Duration>,
+    /// Optional outbound HTTP proxy. When set, plain `http://` traffic
+    /// uses absolute-form request lines and `Proxy-Authorization:`; HTTPS
+    /// traffic is tunnelled via `CONNECT` before the TLS handshake.
+    /// `socks5://`, `https://` (TLS-to-proxy), and PAC are out of scope.
+    pub(crate) proxy: Option<ProxyConfig>,
+    /// List of host suffixes that bypass the proxy. Matches curl's
+    /// `NO_PROXY` / `--noproxy`: case-insensitive suffix match against
+    /// the request URL host. `*` means "everything bypasses".
+    pub(crate) no_proxy: Vec<String>,
+}
+
+/// Where to route HTTP(S) traffic through. Parsed from a curl-style proxy
+/// URL — typically `http://user:pass@host:port`. Only `http://` proxies are
+/// supported in this milestone; TLS-to-proxy (`https://`) and SOCKS are
+/// rejected with [`Error::UnsupportedScheme`].
+#[derive(Debug, Clone)]
+pub struct ProxyConfig {
+    pub host: String,
+    pub port: u16,
+    /// Credentials to send in `Proxy-Authorization: Basic`. Either parsed
+    /// from `user:pass@proxy` in the proxy URL or supplied separately via
+    /// [`Request::proxy_user`].
+    pub auth: Option<(String, String)>,
+}
+
+impl ProxyConfig {
+    /// Parse a proxy URL such as `http://proxy:8080` or
+    /// `http://user:pass@proxy:3128`. A bare `host:port` (no scheme) is
+    /// also accepted and treated as `http://` — curl behaves the same way
+    /// for the value of `-x`.
+    pub fn parse(s: &str) -> Result<Self> {
+        // Curl accepts `proxy:8080` (no scheme); add one so the URL parser
+        // is happy and our scheme check below still rejects exotic schemes.
+        let normalised: String = if s.contains("://") {
+            s.to_string()
+        } else {
+            format!("http://{s}")
+        };
+        let u = Url::parse(&normalised)?;
+        if u.scheme != "http" {
+            return Err(Error::UnsupportedScheme(format!(
+                "proxy scheme {:?} not supported (only http:// at this milestone)",
+                u.scheme
+            )));
+        }
+        let auth = u
+            .userinfo
+            .as_deref()
+            .map(|info| match info.split_once(':') {
+                Some((u, p)) => (u.to_string(), p.to_string()),
+                None => (info.to_string(), String::new()),
+            });
+        Ok(ProxyConfig {
+            host: u.host.clone(),
+            port: u.port,
+            auth,
+        })
+    }
 }
 
 impl Request {
@@ -75,6 +133,8 @@ impl Request {
             verify_tls: true,
             ca_bundle: None,
             max_time: None,
+            proxy: None,
+            no_proxy: Vec::new(),
         })
     }
 
@@ -160,6 +220,42 @@ impl Request {
     /// Cap on TCP connect time (curl `--connect-timeout`).
     pub fn connect_timeout(mut self, d: Duration) -> Self {
         self.connect_timeout = Some(d);
+        self
+    }
+
+    /// Route through an outbound HTTP proxy. `spec` is curl-style:
+    /// `http://[user:pass@]host:port`, or bare `host:port` which is
+    /// treated as `http://`. For HTTPS targets the proxy tunnel is
+    /// established via `CONNECT host:port` before the TLS handshake;
+    /// for plain HTTP the proxy receives an absolute-form request line.
+    pub fn proxy(mut self, spec: &str) -> Result<Self> {
+        self.proxy = Some(ProxyConfig::parse(spec)?);
+        Ok(self)
+    }
+
+    /// Override (or add) proxy `user:pass` credentials independently of
+    /// the proxy URL. Mirrors curl `--proxy-user`.
+    pub fn proxy_user(mut self, user: &str, pass: &str) -> Result<Self> {
+        match self.proxy.as_mut() {
+            Some(p) => {
+                p.auth = Some((user.to_string(), pass.to_string()));
+                Ok(self)
+            }
+            None => Err(Error::BadResponse(
+                "proxy_user called without a proxy set".into(),
+            )),
+        }
+    }
+
+    /// Replace the no-proxy list (curl `NO_PROXY` / `--noproxy`). Each
+    /// entry is a host suffix matched case-insensitively against the
+    /// target URL's host; a single `*` means "bypass for every host".
+    pub fn no_proxy<I, S>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.no_proxy = entries.into_iter().map(Into::into).collect();
         self
     }
 
@@ -346,10 +442,42 @@ impl Response {
 
 fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
     let stream = tcp_connect(&req, trace)?;
-    write_request(&stream, &req, trace)?;
+    write_request(&stream, &req, via_plain_http_proxy(&req), trace)?;
     let resp = read_response(stream, &req.method, trace)?;
     let _ = writeln!(trace, "* Connection closed");
     Ok(resp)
+}
+
+/// True iff this request is going to a plain-`http://` target via a proxy
+/// and is NOT in the no-proxy bypass set. Such requests must use the
+/// absolute-form request line per RFC 9112 §3.2.2 and carry an optional
+/// `Proxy-Authorization:` header. HTTPS-via-proxy doesn't qualify because
+/// the proxy only sees a `CONNECT` tunnel; the request inside is normal.
+pub(crate) fn via_plain_http_proxy(req: &Request) -> bool {
+    if req.url.scheme != "http" {
+        return false;
+    }
+    match &req.proxy {
+        Some(_) => !proxy_bypassed(req),
+        None => false,
+    }
+}
+
+/// True iff `req.url.host` matches any entry of `req.no_proxy`. A single
+/// `*` matches everything; otherwise each entry is a case-insensitive host
+/// suffix (matching either the whole host or the part after a `.`).
+pub(crate) fn proxy_bypassed(req: &Request) -> bool {
+    if req.no_proxy.iter().any(|e| e.trim() == "*") {
+        return true;
+    }
+    let h = req.url.host.to_ascii_lowercase();
+    req.no_proxy.iter().any(|e| {
+        let e = e.trim().trim_start_matches('.').to_ascii_lowercase();
+        if e.is_empty() {
+            return false;
+        }
+        h == e || h.ends_with(&format!(".{e}"))
+    })
 }
 
 /// Compute the base64 token to send in `Authorization: Basic <token>`,
@@ -424,36 +552,170 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // the cert-only handshake doesn't change behaviour for h2-only servers
     // (those would have been satisfied by the h2 attempt above).
     let tcp = tcp_connect(&req, trace)?;
+    // HTTPS via proxy means we have to ask the proxy to splice us through
+    // to the origin before the TLS handshake — the proxy can't see the
+    // encrypted bytes, so a CONNECT tunnel is the only way.
+    if let Some(p) = req
+        .proxy
+        .as_ref()
+        .filter(|_| !proxy_bypassed(&req) && req.url.scheme == "https")
+    {
+        connect_tunnel(&tcp, &req.url, p, trace)?;
+    }
     let opts = tls_opts_from(&req, &[])?;
     let mut tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     write_tls_info(&tls, trace);
-    write_request(&mut tls, &req, trace)?;
+    // Always origin-form here: even with a proxy in play we've already
+    // tunnelled past it via CONNECT, so the request the origin sees is
+    // the normal direct one.
+    write_request(&mut tls, &req, false, trace)?;
     let resp = read_response(tls, &req.method, trace)?;
     let _ = writeln!(trace, "* Connection closed");
     Ok(resp)
 }
 
+/// Open a TCP socket pointed at whatever the next-hop endpoint actually
+/// is — either the request URL's authority or, when [`Request::proxy`] is
+/// in play and the host isn't in the no-proxy list, the proxy itself.
+///
+/// For HTTPS-via-proxy requests, the caller is expected to invoke
+/// [`connect_tunnel`] on the returned socket before any TLS handshake.
+/// This function intentionally stops at "TCP connected" so that the
+/// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
 fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
-    let addr = format!("{}:{}", req.url.host, req.url.port);
+    let proxy = req.proxy.as_ref().filter(|_| !proxy_bypassed(req));
+    let (target_host, target_port, via_proxy_label) = match proxy {
+        Some(p) => (p.host.as_str(), p.port, true),
+        None => (req.url.host.as_str(), req.url.port, false),
+    };
+    let addr = format!("{target_host}:{target_port}");
     let first = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
         .next()
-        .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
+        .ok_or_else(|| Error::InvalidUrl(target_host.to_string()))?;
     let _ = writeln!(trace, "*   Trying {first}...");
     let stream = match req.connect_timeout {
         Some(t) => TcpStream::connect_timeout(&first, t)?,
         None => TcpStream::connect(first)?,
     };
     let peer = stream.peer_addr().unwrap_or(first);
-    let _ = writeln!(
-        trace,
-        "* Connected to {} ({}) port {}",
-        req.url.host,
-        peer.ip(),
-        peer.port()
-    );
+    if via_proxy_label {
+        let _ = writeln!(
+            trace,
+            "* Connected to proxy {} ({}) port {}",
+            target_host,
+            peer.ip(),
+            peer.port()
+        );
+    } else {
+        let _ = writeln!(
+            trace,
+            "* Connected to {} ({}) port {}",
+            req.url.host,
+            peer.ip(),
+            peer.port()
+        );
+    }
     stream.set_read_timeout(req.read_timeout)?;
     stream.set_write_timeout(req.read_timeout)?;
     Ok(stream)
+}
+
+/// Issue an HTTP/1.1 `CONNECT <host>:<port>` over an already-open TCP
+/// socket, parse the response line and headers, and return cleanly if the
+/// proxy returned `2xx` — the socket is then a transparent byte pipe to
+/// `target`, ready to be wrapped in TLS. A non-2xx response (407 Proxy
+/// Authentication Required is the common one) surfaces as
+/// [`Error::BadResponse`] so the caller can report it.
+///
+/// CONNECT responses are headers-only; there's no body. We read the wire
+/// byte-by-byte rather than through a [`BufReader`] because any data the
+/// server sends after the CRLF/CRLF terminator (typically the first
+/// `ClientHello` byte) belongs to the *next* layer, not us — losing it
+/// to a BufReader's prefetch would corrupt the TLS handshake.
+pub(crate) fn connect_tunnel<S: Read + Write>(
+    mut stream: S,
+    target: &Url,
+    proxy: &ProxyConfig,
+    trace: &mut dyn Write,
+) -> Result<()> {
+    let host_port = format!("{}:{}", target.host, target.port);
+    let mut buf = Vec::with_capacity(256);
+    write!(&mut buf, "CONNECT {host_port} HTTP/1.1\r\n")?;
+    write!(&mut buf, "Host: {host_port}\r\n")?;
+    write!(&mut buf, "User-Agent: {DEFAULT_USER_AGENT}\r\n")?;
+    write!(&mut buf, "Proxy-Connection: Keep-Alive\r\n")?;
+    if let Some((user, pass)) = &proxy.auth {
+        let combined = format!("{user}:{pass}");
+        let creds = crate::websocket::base64_encode(combined.as_bytes());
+        write!(&mut buf, "Proxy-Authorization: Basic {creds}\r\n")?;
+    }
+    write!(&mut buf, "\r\n")?;
+
+    // Mirror the CONNECT we put on the wire into the trace so `-v` shows
+    // it before the TLS handshake noise.
+    let head = String::from_utf8_lossy(&buf);
+    let head_no_final_crlf = head.strip_suffix("\r\n").unwrap_or(&head);
+    for line in head_no_final_crlf.split("\r\n") {
+        let _ = writeln!(trace, "> {line}");
+    }
+    stream.write_all(&buf)?;
+    stream.flush()?;
+
+    // Read the response one byte at a time until we see the terminator.
+    // Bounded by MAX_HEADER_BYTES so a misbehaving proxy can't blow memory.
+    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    let mut status_line: Option<String> = None;
+    let mut total = 0usize;
+    loop {
+        if total > MAX_HEADER_BYTES {
+            return Err(Error::BadResponse(
+                "CONNECT response headers exceed 64 KiB".into(),
+            ));
+        }
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        total += 1;
+        line_buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            let trimmed_owned = String::from_utf8_lossy(
+                line_buf
+                    .strip_suffix(b"\n")
+                    .unwrap_or(&line_buf)
+                    .strip_suffix(b"\r")
+                    .unwrap_or(line_buf.strip_suffix(b"\n").unwrap_or(&line_buf)),
+            )
+            .into_owned();
+            let _ = writeln!(trace, "< {trimmed_owned}");
+            if status_line.is_none() {
+                status_line = Some(trimmed_owned.clone());
+            }
+            if trimmed_owned.is_empty() {
+                break;
+            }
+            line_buf.clear();
+        }
+    }
+
+    let status = status_line.ok_or_else(|| Error::BadResponse("CONNECT: no status line".into()))?;
+    let parts: Vec<&str> = status.splitn(3, ' ').collect();
+    if parts.len() < 2 {
+        return Err(Error::BadResponse(format!(
+            "CONNECT: malformed status line {status:?}"
+        )));
+    }
+    let code: u16 = parts[1]
+        .parse()
+        .map_err(|_| Error::BadResponse(format!("CONNECT: bad status {:?}", parts[1])))?;
+    if !(200..300).contains(&code) {
+        return Err(Error::BadResponse(format!(
+            "CONNECT to {host_port} failed: {status}"
+        )));
+    }
+    let _ = writeln!(trace, "* CONNECT tunnel established to {host_port}");
+    Ok(())
 }
 
 fn write_tls_info<S: Read + Write>(tls: &crate::tls::TlsStream<S>, trace: &mut dyn Write) {
@@ -505,7 +767,12 @@ fn write_tls_info<S: Read + Write>(tls: &crate::tls::TlsStream<S>, trace: &mut d
     }
 }
 
-fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Result<()> {
+fn write_request<W: Write>(
+    mut w: W,
+    req: &Request,
+    absolute_form: bool,
+    trace: &mut dyn Write,
+) -> Result<()> {
     let host_header = if (req.url.scheme == "http" && req.url.port == 80)
         || (req.url.scheme == "https" && req.url.port == 443)
     {
@@ -515,8 +782,40 @@ fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Re
     };
 
     let mut buf = Vec::with_capacity(256);
-    write!(&mut buf, "{} {} HTTP/1.1\r\n", req.method, req.url.path)?;
+    // Absolute-form per RFC 9112 §3.2.2: required when sending to a proxy
+    // on a plain HTTP connection. Origin-form (`/path`) for everything
+    // else (direct connections, and HTTPS-via-proxy because we tunnel).
+    if absolute_form {
+        // Re-serialise the target as `scheme://host[:port]<path>` so the
+        // proxy can route it. Userinfo is omitted — we move it into
+        // `Authorization:`/`Proxy-Authorization:` elsewhere.
+        let target = if (req.url.scheme == "http" && req.url.port == 80)
+            || (req.url.scheme == "https" && req.url.port == 443)
+        {
+            format!("{}://{}{}", req.url.scheme, req.url.host, req.url.path)
+        } else {
+            format!(
+                "{}://{}:{}{}",
+                req.url.scheme, req.url.host, req.url.port, req.url.path
+            )
+        };
+        write!(&mut buf, "{} {target} HTTP/1.1\r\n", req.method)?;
+    } else {
+        write!(&mut buf, "{} {} HTTP/1.1\r\n", req.method, req.url.path)?;
+    }
     write!(&mut buf, "Host: {host_header}\r\n")?;
+    // Proxy-Authorization: Basic ... rides with every request to a plain
+    // HTTP proxy. (For HTTPS the credentials went on the CONNECT, not
+    // here — origin servers must not see them.)
+    if absolute_form {
+        if let Some(p) = &req.proxy {
+            if let Some((user, pass)) = &p.auth {
+                let combined = format!("{user}:{pass}");
+                let creds = crate::websocket::base64_encode(combined.as_bytes());
+                write!(&mut buf, "Proxy-Authorization: Basic {creds}\r\n")?;
+            }
+        }
+    }
 
     let mut have_ua = false;
     let mut have_accept = false;
@@ -800,5 +1099,172 @@ mod tests {
     #[test]
     fn rejects_non_http() {
         assert!(parse_status_line("RTSP/1.0 200 OK").is_err());
+    }
+
+    #[test]
+    fn proxy_parse_basic() {
+        let p = ProxyConfig::parse("http://proxy.example:3128").unwrap();
+        assert_eq!(p.host, "proxy.example");
+        assert_eq!(p.port, 3128);
+        assert!(p.auth.is_none());
+    }
+
+    #[test]
+    fn proxy_parse_with_creds() {
+        let p = ProxyConfig::parse("http://alice:hunter2@proxy:8080").unwrap();
+        assert_eq!(p.host, "proxy");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.auth.as_ref().unwrap().0, "alice");
+        assert_eq!(p.auth.as_ref().unwrap().1, "hunter2");
+    }
+
+    #[test]
+    fn proxy_parse_bare_hostport_is_http() {
+        // Curl accepts `proxy:8080`; we normalise to http://.
+        let p = ProxyConfig::parse("proxy.local:8080").unwrap();
+        assert_eq!(p.host, "proxy.local");
+        assert_eq!(p.port, 8080);
+    }
+
+    #[test]
+    fn proxy_parse_rejects_https() {
+        let err = ProxyConfig::parse("https://proxy:443").unwrap_err();
+        matches!(err, Error::UnsupportedScheme(_));
+    }
+
+    #[test]
+    fn proxy_bypass_matches_suffix() {
+        let mut req = Request::get("http://api.example.com/x").unwrap();
+        req.proxy = Some(ProxyConfig::parse("http://proxy:8080").unwrap());
+        req.no_proxy = vec!["example.com".into()];
+        assert!(proxy_bypassed(&req));
+        // sibling host not under example.com
+        req.url = Url::parse("http://other.org/x").unwrap();
+        assert!(!proxy_bypassed(&req));
+    }
+
+    #[test]
+    fn proxy_bypass_wildcard() {
+        let mut req = Request::get("http://anywhere/").unwrap();
+        req.proxy = Some(ProxyConfig::parse("http://p:1").unwrap());
+        req.no_proxy = vec!["*".into()];
+        assert!(proxy_bypassed(&req));
+    }
+
+    #[test]
+    fn connect_tunnel_happy_path() {
+        // A tiny mock stream: serves the canned `HTTP/1.1 200 OK\r\n\r\n`
+        // response and records everything written to it. Confirms that the
+        // CONNECT line and Host: target are correctly framed and that the
+        // tunnel completes without consuming any byte past the terminator.
+        use std::io::{self, Cursor};
+        struct Mock {
+            written: Vec<u8>,
+            reply: Cursor<Vec<u8>>,
+            trailing: Vec<u8>, // bytes the reader would deliver AFTER the response
+        }
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.reply.read(buf)?;
+                if n == 0 && !self.trailing.is_empty() {
+                    let take = buf.len().min(self.trailing.len());
+                    buf[..take].copy_from_slice(&self.trailing[..take]);
+                    self.trailing.drain(..take);
+                    return Ok(take);
+                }
+                Ok(n)
+            }
+        }
+        impl Write for Mock {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut mock = Mock {
+            written: Vec::new(),
+            reply: Cursor::new(b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec()),
+            // Pretend the server pre-sent the first byte of a TLS
+            // ClientHello immediately after the terminator. The tunnel
+            // function must NOT have eaten it.
+            trailing: vec![0x16],
+        };
+        let target = Url::parse("https://origin.example:443/").unwrap();
+        let proxy = ProxyConfig {
+            host: "proxy".into(),
+            port: 3128,
+            auth: Some(("u".into(), "p".into())),
+        };
+        connect_tunnel(&mut mock, &target, &proxy, &mut io::sink()).unwrap();
+
+        let written = String::from_utf8(mock.written.clone()).unwrap();
+        assert!(
+            written.starts_with("CONNECT origin.example:443 HTTP/1.1\r\n"),
+            "request line missing: {written:?}",
+        );
+        assert!(
+            written.contains("Host: origin.example:443\r\n"),
+            "Host header missing: {written:?}",
+        );
+        assert!(
+            written.contains("Proxy-Authorization: Basic dTpw\r\n"),
+            "auth header missing or wrong: {written:?}",
+        );
+        // The trailing 0x16 must still be readable through the same stream —
+        // any BufReader-style prefetch would have stolen it.
+        let mut byte = [0u8; 1];
+        assert_eq!(mock.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte[0], 0x16, "next-layer byte was consumed by the tunnel");
+    }
+
+    #[test]
+    fn connect_tunnel_reports_407() {
+        use std::io::{self, Cursor};
+        let payload =
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n";
+        let mut mock = std::io::Cursor::new(Vec::new());
+        // We need a Read+Write; chain Cursor over a buffer that has the
+        // canned reply followed by writes appended; the simplest is to use
+        // two structs but for one test just inline a tiny helper.
+        struct RW<'a> {
+            inner: Cursor<&'a [u8]>,
+            sink: &'a mut Vec<u8>,
+        }
+        impl<'a> Read for RW<'a> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(b)
+            }
+        }
+        impl<'a> Write for RW<'a> {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.sink.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Vec::new();
+        let mut rw = RW {
+            inner: Cursor::new(payload),
+            sink: &mut sink,
+        };
+        let target = Url::parse("https://origin/").unwrap();
+        let proxy = ProxyConfig {
+            host: "p".into(),
+            port: 1,
+            auth: None,
+        };
+        let err = connect_tunnel(&mut rw, &target, &proxy, &mut io::sink()).unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("407"), "got {msg:?}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // unused so clippy doesn't complain about `mock`
+        let _ = mock.write(&[]);
     }
 }

@@ -451,3 +451,98 @@ fn jar_is_empty_when_server_sets_no_cookie() {
         "should not have sent any Cookie: header"
     );
 }
+
+/// When `-x` is set against a plain-HTTP URL, rsurl must:
+///   * connect to the proxy address, not the origin,
+///   * send the request line in absolute-URI form per RFC 9112 §3.2.2,
+///   * preserve `Host:` as the origin authority.
+#[test]
+fn plain_http_via_proxy_uses_absolute_form() {
+    let proxy = TestServer::start(|req: SReq| {
+        // Echo the request line (built from method + path) and the Host
+        // header so the test can assert exactly what hit the wire.
+        let host = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let body = format!("{} {}\nHost: {host}\n", req.method, req.path);
+        SResp::ok(body)
+    });
+    // Origin URL — we never actually connect to it; the proxy claims to
+    // be the intermediary, so the test's TestServer (the proxy) gets the
+    // bytes. Use a host name DNS will not resolve so a regression that
+    // skips the proxy fails loudly rather than silently hitting the
+    // network.
+    let origin = "http://origin.invalid/some/path?q=1";
+    let resp = Request::get(origin)
+        .unwrap()
+        .proxy(proxy.url("").trim_end_matches('/'))
+        .unwrap()
+        .send()
+        .unwrap();
+    let text = String::from_utf8(resp.body).unwrap();
+    assert!(
+        text.contains("GET http://origin.invalid/some/path?q=1\n"),
+        "absolute-form request line missing: {text}",
+    );
+    assert!(
+        text.contains("Host: origin.invalid\n"),
+        "Host should be the origin's authority, not the proxy's: {text}",
+    );
+}
+
+/// `--proxy-user` (or credentials in the proxy URL) must land in a
+/// `Proxy-Authorization: Basic <b64>` header for plain HTTP proxying.
+#[test]
+fn plain_http_via_proxy_with_creds() {
+    use std::sync::{Arc, Mutex};
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cap2 = Arc::clone(&captured);
+    let proxy = TestServer::start(move |req: SReq| {
+        let pa = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("proxy-authorization"))
+            .map(|(_, v)| v.clone());
+        *cap2.lock().unwrap() = pa;
+        SResp::ok("ok")
+    });
+    let proxy_url = format!("http://alice:hunter2@{}", proxy.addr);
+    Request::get("http://origin.invalid/")
+        .unwrap()
+        .proxy(&proxy_url)
+        .unwrap()
+        .send()
+        .unwrap();
+    let got = captured.lock().unwrap().clone();
+    // base64("alice:hunter2") = "YWxpY2U6aHVudGVyMg=="
+    assert_eq!(got.as_deref(), Some("Basic YWxpY2U6aHVudGVyMg=="));
+}
+
+/// `--noproxy` matches the target host → connection goes direct.
+/// We assert this by pointing `proxy()` at a *closed* port and verifying
+/// the request still succeeds: only a direct connection to the real
+/// origin (the TestServer) can have served it.
+#[test]
+fn noproxy_bypasses_proxy() {
+    let origin = TestServer::start(|_req| SResp::ok("direct"));
+    // Reserve a port and immediately release it so the proxy "endpoint"
+    // is almost certainly closed; the same trick used by
+    // `connect_refused_is_io_error`.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let closed = l.local_addr().unwrap();
+    drop(l);
+
+    let resp = Request::get(&origin.url("/"))
+        .unwrap()
+        .proxy(&format!("http://{closed}"))
+        .unwrap()
+        .no_proxy(["127.0.0.1"])
+        .connect_timeout(Duration::from_secs(2))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"direct");
+}

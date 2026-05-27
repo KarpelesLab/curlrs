@@ -23,6 +23,7 @@ Early, in active development.
 | HTTP/1.1 (all methods) | working | Content-Length, chunked, read-to-EOF body modes |
 | Response compression | working | `gzip` / `deflate` / `x-gzip` decoded transparently (always-on) |
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
+| HTTP proxy (`-x`) | working | absolute-form for plain HTTP, `CONNECT` tunnel for HTTPS, Basic auth, `--noproxy` / `*_PROXY` env vars |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
 | HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; single request/conn, no flow control yet |
 | HTTP/3 over QUIC (RFC 9114) | partial | QUIC + frame layer wired; QPACK Huffman decoder still TODO |
@@ -66,6 +67,10 @@ rsurl --cacert ./roots.pem https://...  # custom trust anchors
 rsurl --max-time 5 -O http://e/foo.bin  # cap total time, save as foo.bin
 rsurl -b cookies.txt -c cookies.txt http://api/...  # load + save jar
 rsurl -b "sid=abc" http://api/...       # send one inline cookie
+rsurl -x http://proxy:3128 http://x/    # plain HTTP via proxy (absolute-form)
+rsurl -x http://proxy:3128 https://x/   # HTTPS via proxy CONNECT tunnel
+rsurl --proxy-user u:p -x http://proxy:3128 https://x/   # Proxy-Authorization
+rsurl --noproxy localhost,.internal -x http://proxy https://x/  # bypass list
 rsurl file:///etc/hostname              # local file
 rsurl dict://dict.org/d:curl            # dictionary lookup
 rsurl gopher://gopher.floodgap.com/     # gopher menu
@@ -74,10 +79,13 @@ rsurl ftp://ftp.example.com/pub/file    # FTP download
 
 Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
 `-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--max-time`,
-`--connect-timeout`, `-O`/`--remote-name`, and `-b`/`--cookie` /
-`-c`/`--cookie-jar` for Netscape-format cookie I/O. Multiple URLs on
-one command line are processed sequentially, with the cookie jar
-shared across them.
+`--connect-timeout`, `-O`/`--remote-name`, `-b`/`--cookie` /
+`-c`/`--cookie-jar` for Netscape-format cookie I/O, and `-x`/`--proxy`
+/ `--proxy-user` / `--noproxy` for HTTP proxying. The usual env vars —
+`HTTPS_PROXY`, lowercase `http_proxy` (for CGI safety), `ALL_PROXY`,
+`NO_PROXY` — are honoured when `-x` is not given. Multiple URLs on one
+command line are processed sequentially, with the cookie jar shared
+across them.
 
 ## C usage
 

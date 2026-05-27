@@ -35,7 +35,7 @@ pub mod ffi;
 
 pub use crate::cookie::{Cookie, CookieJar};
 pub use crate::error::{Error, Result};
-pub use crate::http::{HttpVersionPref, Request, Response};
+pub use crate::http::{HttpVersionPref, ProxyConfig, Request, Response};
 pub use crate::transfer::{transfer, transfer_url};
 pub use crate::url::Url;
 

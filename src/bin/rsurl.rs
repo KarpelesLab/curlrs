@@ -24,6 +24,9 @@
 //!         --http1.1            force HTTP/1.1 (alias: --http1)
 //!     -b, --cookie <data>      cookies: "k=v[; k=v]" or a Netscape file path
 //!     -c, --cookie-jar <file>  write all known cookies to <file> on exit
+//!     -x, --proxy <url>        outbound HTTP proxy (e.g. http://host:port)
+//!         --proxy-user <u:p>   credentials for the proxy
+//!         --noproxy <hosts>    comma-list of host suffixes that bypass it
 //!     -h, --help               print help
 //!     -V, --version            print version
 
@@ -69,6 +72,16 @@ struct Args {
     /// Argument to `-c`/`--cookie-jar`. After all transfers complete, the
     /// jar is written to this path in Netscape `cookies.txt` format.
     cookie_jar: Option<String>,
+    /// `-x`/`--proxy <url>` — outbound HTTP proxy. Bare `host:port` is
+    /// treated as `http://`. Empty string explicitly disables any env-var
+    /// proxy (matches curl's `-x ""`).
+    proxy: Option<String>,
+    /// `--proxy-user <user:pass>` — overrides any credentials embedded in
+    /// the proxy URL.
+    proxy_user: Option<(String, String)>,
+    /// `--noproxy <hosts>` — comma-separated host suffixes that bypass
+    /// the proxy. A single `*` bypasses everything.
+    noproxy: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -154,6 +167,65 @@ fn build_initial_jar(args: &Args) -> Result<Option<CookieJar>, String> {
         }
     }
     Ok(Some(jar))
+}
+
+/// Decide which proxy URL applies to this request. Precedence (highest
+/// first), matching curl:
+///   1. `-x`/`--proxy` on the command line; an empty string explicitly
+///      means "no proxy", even if env vars are set.
+///   2. `HTTPS_PROXY` (case-insensitive) when the target is `https://`.
+///   3. `HTTP_PROXY` (case-insensitive) when the target is `http://` —
+///      but **only the lowercase** `http_proxy` env var to match curl's
+///      CGI-confusion mitigation (uppercase `HTTP_PROXY` can be set by
+///      remote clients via the `Proxy:` header).
+///   4. `ALL_PROXY` / `all_proxy` as a catch-all.
+///
+/// Returns `None` if no proxy applies.
+fn resolve_proxy_spec(url: &Url, args: &Args) -> Option<String> {
+    if let Some(spec) = &args.proxy {
+        if spec.is_empty() {
+            return None;
+        }
+        return Some(spec.clone());
+    }
+    // Helper that reads an env var, trying the uppercase form, then the
+    // lowercase form. Empty values count as unset.
+    let read = |upper: &str, lower: &str| -> Option<String> {
+        for k in [upper, lower] {
+            if let Ok(v) = std::env::var(k) {
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    };
+    let scheme_proxy = match url.scheme.as_str() {
+        "https" => read("HTTPS_PROXY", "https_proxy"),
+        // Avoid uppercase HTTP_PROXY (curl historical caveat — see doc above)
+        "http" => match std::env::var("http_proxy") {
+            Ok(v) if !v.is_empty() => Some(v),
+            _ => None,
+        },
+        _ => None,
+    };
+    scheme_proxy.or_else(|| read("ALL_PROXY", "all_proxy"))
+}
+
+/// Resolve the no-proxy list: explicit `--noproxy` wins; otherwise we
+/// look at `NO_PROXY` / `no_proxy`. Empty string means "no bypass set".
+fn resolve_noproxy(args: &Args) -> Option<String> {
+    if let Some(v) = &args.noproxy {
+        return Some(v.clone());
+    }
+    for k in ["NO_PROXY", "no_proxy"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// Apply explicit `-b "k=v; k2=v2"` cookies to the jar for `request_url`'s
@@ -259,6 +331,34 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if let Some(secs) = args.connect_timeout {
         req = req.connect_timeout(Duration::from_secs(secs));
+    }
+
+    // Proxy: explicit `-x` wins over env vars; `-x ""` disables both.
+    let proxy_spec = resolve_proxy_spec(&parsed_url, args);
+    if let Some(spec) = proxy_spec {
+        req = match req.proxy(&spec) {
+            Ok(r) => r,
+            Err(e) => {
+                if !args.silent {
+                    eprintln!("rsurl: --proxy: {e}");
+                }
+                return 5;
+            }
+        };
+        if let Some((u, p)) = &args.proxy_user {
+            req = match req.proxy_user(u, p) {
+                Ok(r) => r,
+                Err(e) => {
+                    if !args.silent {
+                        eprintln!("rsurl: --proxy-user: {e}");
+                    }
+                    return 5;
+                }
+            };
+        }
+    }
+    if let Some(list) = resolve_noproxy(args) {
+        req = req.no_proxy(list.split(',').map(str::trim).filter(|s| !s.is_empty()));
     }
 
     // If `-b "k=v"` was given, apply those cookies to the jar against the
@@ -382,6 +482,16 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-O" | "--remote-name" => a.remote_name = true,
             "-b" | "--cookie" => a.cookie_in = Some(next_val(&mut it, arg)?),
             "-c" | "--cookie-jar" => a.cookie_jar = Some(next_val(&mut it, arg)?),
+            "-x" | "--proxy" => a.proxy = Some(next_val(&mut it, arg)?),
+            "--proxy-user" => {
+                let v = next_val(&mut it, arg)?;
+                let (u, p) = match v.split_once(':') {
+                    Some((u, p)) => (u.to_string(), p.to_string()),
+                    None => (v.clone(), String::new()),
+                };
+                a.proxy_user = Some((u, p));
+            }
+            "--noproxy" => a.noproxy = Some(next_val(&mut it, arg)?),
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -507,6 +617,11 @@ Options:
   -b, --cookie <data>      cookies to send: \"k=v[; k2=v2]\" or path to a
                            Netscape cookies.txt file
   -c, --cookie-jar <file>  write all known cookies to <file> on exit
+  -x, --proxy <url>        route via HTTP proxy (e.g. http://host:8080).
+                           Also reads HTTPS_PROXY / http_proxy / ALL_PROXY.
+      --proxy-user <u:p>   credentials for the proxy (Basic)
+      --noproxy <hosts>    comma-separated host suffixes that bypass the
+                           proxy; \"*\" bypasses everything
   -h, --help               print this help
   -V, --version            print version
 "

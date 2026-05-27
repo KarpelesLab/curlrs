@@ -1307,12 +1307,22 @@ impl Encoder {
 // ---------------------------------------------------------------------------
 
 fn tcp_connect(req: &Request) -> Result<TcpStream> {
-    let addr = format!("{}:{}", req.url.host, req.url.port);
+    // Route through the proxy when one is configured and the target host
+    // isn't bypassed. Symmetric to `crate::http::tcp_connect`.
+    let proxy = req
+        .proxy
+        .as_ref()
+        .filter(|_| !crate::http::proxy_bypassed(req));
+    let (target_host, target_port) = match proxy {
+        Some(p) => (p.host.as_str(), p.port),
+        None => (req.url.host.as_str(), req.url.port),
+    };
+    let addr = format!("{target_host}:{target_port}");
     let stream = match req.connect_timeout {
         Some(t) => {
             let first = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
                 .next()
-                .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
+                .ok_or_else(|| Error::InvalidUrl(target_host.to_string()))?;
             TcpStream::connect_timeout(&first, t)?
         }
         None => TcpStream::connect(&addr)?,
@@ -2342,6 +2352,19 @@ fn global_pool() -> &'static Mutex<PoolInner<TlsStream<TcpStream>>> {
 /// wants a fresh `Connection` (currently no other call sites).
 fn dial_h2(req: &Request) -> Result<Connection<TlsStream<TcpStream>>> {
     let tcp = tcp_connect(req)?;
+    // HTTPS-over-proxy: CONNECT to establish a transparent tunnel before
+    // the TLS handshake. h2c (cleartext HTTP/2) over a proxy is rejected
+    // higher up in `send()`, so by here we know scheme == "https".
+    if let Some(p) = req
+        .proxy
+        .as_ref()
+        .filter(|_| !crate::http::proxy_bypassed(req))
+    {
+        // No trace plumbing here yet — this path runs from `send()` which
+        // doesn't carry one. The handshake error (if any) bubbles up the
+        // call stack with enough context.
+        crate::http::connect_tunnel(&tcp, &req.url, p, &mut std::io::sink())?;
+    }
     let opts = crate::http::tls_opts_from(req, &[b"h2"])?;
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
