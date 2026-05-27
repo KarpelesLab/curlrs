@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -54,9 +54,23 @@ impl Request {
     }
 
     pub fn send(self) -> Result<Response> {
+        self.send_to(&mut io::sink())
+    }
+
+    /// Like [`send`](Self::send), but writes a curl-style `-v` trace to
+    /// `trace` as the request progresses: `*` lines for connection / TLS
+    /// events, `>` lines for every byte of the request actually placed on
+    /// the wire, `<` lines for every status / header byte received. The
+    /// trace is built from the same buffers used for I/O, so it cannot
+    /// drift from what was sent.
+    pub fn send_traced(self, trace: &mut dyn Write) -> Result<Response> {
+        self.send_to(trace)
+    }
+
+    fn send_to(self, trace: &mut dyn Write) -> Result<Response> {
         match self.url.scheme.as_str() {
-            "http" => send_plain(self),
-            "https" => send_https(self),
+            "http" => send_plain(self, trace),
+            "https" => send_https(self, trace),
             other => Err(Error::UnsupportedScheme(other.to_string())),
         }
     }
@@ -82,38 +96,97 @@ impl Response {
     }
 }
 
-fn send_plain(req: Request) -> Result<Response> {
-    let stream = tcp_connect(&req)?;
-    write_request(&stream, &req)?;
-    read_response(stream, &req.method)
+fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    let stream = tcp_connect(&req, trace)?;
+    write_request(&stream, &req, trace)?;
+    let resp = read_response(stream, &req.method, trace)?;
+    let _ = writeln!(trace, "* Connection closed");
+    Ok(resp)
 }
 
-fn send_https(req: Request) -> Result<Response> {
-    let tcp = tcp_connect(&req)?;
+fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    let tcp = tcp_connect(&req, trace)?;
     let mut tls = crate::tls::connect_over(tcp, &req.url.host)?;
-    write_request(&mut tls, &req)?;
-    read_response(tls, &req.method)
+    write_tls_info(&tls, trace);
+    write_request(&mut tls, &req, trace)?;
+    let resp = read_response(tls, &req.method, trace)?;
+    let _ = writeln!(trace, "* Connection closed");
+    Ok(resp)
 }
 
-fn tcp_connect(req: &Request) -> Result<TcpStream> {
+fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
     let addr = format!("{}:{}", req.url.host, req.url.port);
+    let first = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
+        .next()
+        .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
+    let _ = writeln!(trace, "*   Trying {first}...");
     let stream = match req.connect_timeout {
-        Some(t) => {
-            let addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&addr)?.collect();
-            let first = addrs
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
-            TcpStream::connect_timeout(&first, t)?
-        }
-        None => TcpStream::connect(&addr)?,
+        Some(t) => TcpStream::connect_timeout(&first, t)?,
+        None => TcpStream::connect(first)?,
     };
+    let peer = stream.peer_addr().unwrap_or(first);
+    let _ = writeln!(
+        trace,
+        "* Connected to {} ({}) port {}",
+        req.url.host,
+        peer.ip(),
+        peer.port()
+    );
     stream.set_read_timeout(req.read_timeout)?;
     stream.set_write_timeout(req.read_timeout)?;
     Ok(stream)
 }
 
-fn write_request<W: Write>(mut w: W, req: &Request) -> Result<()> {
+fn write_tls_info<S: Read + Write>(tls: &crate::tls::TlsStream<S>, trace: &mut dyn Write) {
+    if let Some(v) = tls.negotiated_version() {
+        let _ = writeln!(trace, "* SSL connection using {v:?}");
+    }
+    match tls.alpn_selected() {
+        Some(p) => {
+            let _ = writeln!(
+                trace,
+                "* ALPN: server accepted {}",
+                String::from_utf8_lossy(p)
+            );
+        }
+        None => {
+            let _ = writeln!(trace, "* ALPN: no protocol negotiated");
+        }
+    }
+    let certs = tls.peer_certificates();
+    let _ = writeln!(trace, "* Server certificate chain: {} cert(s)", certs.len());
+    for (i, der) in certs.iter().enumerate() {
+        match purecrypto::x509::Certificate::from_der(der.clone()) {
+            Ok(cert) => {
+                let subject = cert
+                    .subject()
+                    .ok()
+                    .and_then(|d| d.common_name)
+                    .unwrap_or_else(|| "?".into());
+                let issuer = cert
+                    .issuer()
+                    .ok()
+                    .and_then(|d| d.common_name)
+                    .unwrap_or_else(|| "?".into());
+                let _ = writeln!(trace, "*  [{i}] subject CN: {subject}");
+                let _ = writeln!(trace, "*      issuer  CN: {issuer}");
+                if let Ok(v) = cert.validity() {
+                    let _ = writeln!(
+                        trace,
+                        "*      valid: {}  ->  {}",
+                        v.not_before.as_str(),
+                        v.not_after.as_str()
+                    );
+                }
+            }
+            Err(_) => {
+                let _ = writeln!(trace, "*  [{i}] (DER unparseable, {} bytes)", der.len());
+            }
+        }
+    }
+}
+
+fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Result<()> {
     let host_header = if (req.url.scheme == "http" && req.url.port == 80)
         || (req.url.scheme == "https" && req.url.port == 443)
     {
@@ -152,15 +225,26 @@ fn write_request<W: Write>(mut w: W, req: &Request) -> Result<()> {
     }
     write!(&mut buf, "Connection: close\r\n\r\n")?;
 
+    // Trace what we're about to put on the wire — read straight from `buf`
+    // so the trace can't lie about what was sent. Stripping just one trailing
+    // `\r\n` leaves the header terminator's blank line, which becomes the
+    // closing `> ` line on the trace.
+    let head = String::from_utf8_lossy(&buf);
+    let head_no_final_crlf = head.strip_suffix("\r\n").unwrap_or(&head);
+    for line in head_no_final_crlf.split("\r\n") {
+        let _ = writeln!(trace, "> {line}");
+    }
+
     w.write_all(&buf)?;
     if !req.body.is_empty() {
+        let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
         w.write_all(&req.body)?;
     }
     w.flush()?;
     Ok(())
 }
 
-fn read_response<R: Read>(stream: R, method: &str) -> Result<Response> {
+fn read_response<R: Read>(stream: R, method: &str, trace: &mut dyn Write) -> Result<Response> {
     let mut r = BufReader::new(stream);
 
     let mut status_line = String::new();
@@ -168,7 +252,9 @@ fn read_response<R: Read>(stream: R, method: &str) -> Result<Response> {
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
-    let (version, status, reason) = parse_status_line(status_line.trim_end_matches(['\r', '\n']))?;
+    let trimmed_status = status_line.trim_end_matches(['\r', '\n']);
+    let _ = writeln!(trace, "< {trimmed_status}");
+    let (version, status, reason) = parse_status_line(trimmed_status)?;
 
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut header_bytes = 0usize;
@@ -183,6 +269,7 @@ fn read_response<R: Read>(stream: R, method: &str) -> Result<Response> {
             return Err(Error::BadResponse("headers exceed 64 KiB".into()));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
+        let _ = writeln!(trace, "< {trimmed}");
         if trimmed.is_empty() {
             break;
         }
@@ -193,6 +280,7 @@ fn read_response<R: Read>(stream: R, method: &str) -> Result<Response> {
     }
 
     let body = read_body(&mut r, &headers, &version, status, method)?;
+    let _ = writeln!(trace, "* Received {} body bytes", body.len());
 
     Ok(Response {
         status,

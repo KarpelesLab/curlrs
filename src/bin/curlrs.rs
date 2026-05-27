@@ -114,11 +114,13 @@ fn main() -> ExitCode {
         req = req.body(body_bytes);
     }
 
-    if args.verbose {
-        let _ = print_request_trace(req.url(), &method, &args);
-    }
-
-    let resp = match req.send() {
+    let send_result = if args.verbose {
+        let mut err = io::stderr().lock();
+        req.send_traced(&mut err)
+    } else {
+        req.send()
+    };
+    let resp = match send_result {
         Ok(r) => r,
         Err(e) => {
             if !args.silent {
@@ -127,10 +129,6 @@ fn main() -> ExitCode {
             return ExitCode::from(7);
         }
     };
-
-    if args.verbose {
-        let _ = print_response_trace(&resp);
-    }
 
     let exit_for_status = if (200..400).contains(&resp.status) {
         ExitCode::SUCCESS
@@ -246,31 +244,6 @@ fn write_output(resp: &Response, args: &Args) -> io::Result<()> {
         out.write_all(b"\r\n")?;
     }
     out.write_all(&resp.body)?;
-    Ok(())
-}
-
-fn print_request_trace(url: &curlrs::Url, method: &str, args: &Args) -> io::Result<()> {
-    let mut err = io::stderr().lock();
-    writeln!(err, "* Connecting to {}:{}", url.host, url.port)?;
-    writeln!(err, "> {} {} HTTP/1.1", method, url.path)?;
-    writeln!(err, "> Host: {}:{}", url.host, url.port)?;
-    for (k, v) in &args.headers {
-        writeln!(err, "> {k}: {v}")?;
-    }
-    if let Some(ua) = &args.user_agent {
-        writeln!(err, "> User-Agent: {ua}")?;
-    }
-    writeln!(err, ">")?;
-    Ok(())
-}
-
-fn print_response_trace(resp: &Response) -> io::Result<()> {
-    let mut err = io::stderr().lock();
-    writeln!(err, "< {} {} {}", resp.version, resp.status, resp.reason)?;
-    for (k, v) in &resp.headers {
-        writeln!(err, "< {k}: {v}")?;
-    }
-    writeln!(err, "<")?;
     Ok(())
 }
 

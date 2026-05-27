@@ -108,6 +108,21 @@ pub fn connect_over<S: Read + Write>(transport: S, sni: &str) -> Result<TlsStrea
 }
 
 impl<S: Read + Write> TlsStream<S> {
+    /// TLS version negotiated during the handshake, if it succeeded.
+    pub fn negotiated_version(&self) -> Option<purecrypto::tls::ProtocolVersion> {
+        self.conn.negotiated_version()
+    }
+
+    /// ALPN protocol the server selected, or `None` if ALPN was not negotiated.
+    pub fn alpn_selected(&self) -> Option<&[u8]> {
+        self.conn.alpn_selected()
+    }
+
+    /// Peer certificate chain in wire order (leaf first), each entry DER-encoded.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        self.conn.peer_certificates()
+    }
+
     fn run_handshake(&mut self) -> Result<()> {
         let mut buf = [0u8; READ_CHUNK];
         loop {
