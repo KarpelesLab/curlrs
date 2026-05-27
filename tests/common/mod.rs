@@ -277,6 +277,12 @@ fn accept_loop(
 }
 
 fn handle_conn(mut stream: TcpStream, handler: &Handler, keep_alive: bool) {
+    // On Windows, accepted sockets inherit the listener's non-blocking flag.
+    // Our listener is non-blocking (for the stop-flag poll loop), so without
+    // this the keep-alive worker's `parse_request` would see `WouldBlock` and
+    // tear the connection down before the client can pipeline a second
+    // request. Force blocking I/O with explicit timeouts.
+    let _ = stream.set_nonblocking(false);
     // Generous-ish timeouts: tests should be fast; if we hit one of these
     // something is genuinely wrong with the client.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
