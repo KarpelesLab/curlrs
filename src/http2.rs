@@ -26,10 +26,13 @@
 //!   WINDOW_UPDATE, GOAWAY, RST_STREAM. We auto-ACK SETTINGS, auto-PONG
 //!   PING; everything else on a non-target stream is ignored.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
+use crate::tls::TlsStream;
 use crate::{Request, Response};
 
 // ---------------------------------------------------------------------------
@@ -1293,7 +1296,7 @@ struct Connection<S: Read + Write> {
     conn_send_window: ConnSendWindow,
     conn_recv_window: ConnRecvWindow,
     decoder: Decoder,
-    streams: std::collections::HashMap<u32, Stream>,
+    streams: HashMap<u32, Stream>,
     /// Next client-initiated stream id to allocate. Per §5.1.1, client
     /// streams are odd-numbered and strictly increasing: 1, 3, 5, …
     next_stream_id: u32,
@@ -1343,11 +1346,39 @@ impl<S: Read + Write> Connection<S> {
             conn_send_window: ConnSendWindow::new(),
             conn_recv_window: ConnRecvWindow::new(),
             decoder: Decoder::new(),
-            streams: std::collections::HashMap::new(),
+            streams: HashMap::new(),
             next_stream_id: 1,
             goaway_received: None,
             expecting_continuation: None,
         })
+    }
+
+    /// Cheap, no-I/O check that this connection is structurally safe to hand
+    /// out from the pool for another request:
+    ///
+    /// - we have not received a GOAWAY (or, if we did, we still have at least
+    ///   one in-flight stream — but for pooling purposes we treat *any*
+    ///   GOAWAY as "do not pool"); and
+    /// - there are no streams left from a previous request (a checked-out
+    ///   conn with non-empty `streams` means the previous user crashed mid-
+    ///   request and left state behind; we cannot trust the wire position).
+    ///
+    /// We deliberately do NOT probe the socket. If the peer closed silently,
+    /// the next read/write will surface that as an I/O error and the caller
+    /// drops the conn instead of re-pooling it.
+    fn is_usable(&self) -> bool {
+        if self.goaway_received.is_some() {
+            return false;
+        }
+        if !self.streams.is_empty() {
+            return false;
+        }
+        // Defensive: if we somehow exhausted the stream-id space, the next
+        // open_stream would error — don't bother handing this conn back.
+        if self.next_stream_id >= 0x8000_0000 {
+            return false;
+        }
+        true
     }
 
     /// Allocate the next client-initiated stream id and register an empty
@@ -1992,11 +2023,152 @@ fn next_data_chunk_size(max_frame_size: usize, available: i64, remaining: usize)
     cap_window as usize
 }
 
-/// Send a single request/response over a fresh HTTP/2 connection.
+// ---------------------------------------------------------------------------
+// Connection pool.
+// ---------------------------------------------------------------------------
+//
+// A process-wide, lazy-init pool of idle HTTP/2 connections keyed by
+// `(scheme, host, port)`. The goal is conservative: avoid the TCP+TLS+h2
+// preface handshake on repeat requests to the same authority. We are still
+// fully synchronous (no async / threads / executor) — two threads that both
+// hit the same checked-out conn will serialize on its `Mutex`. That gives
+// "sequential multiplexing" reuse, not concurrent streams on one conn; the
+// latter would require I/O multiplexing we don't have. Saving the handshake
+// is the bulk of the win anyway.
+//
+// Connections with non-default TLS opts (`verify_tls=false` or `ca_bundle`
+// set) bypass the pool entirely. Putting those into the same map as default
+// conns risks reusing a "skip-verify" session for a future caller that did
+// NOT ask to skip verification — silent loss of TLS verification. The cheap
+// fix is to refuse to pool them; a future task can either (a) add the TLS
+// opts into the key, or (b) maintain separate pools per opts profile. We
+// pick the cheap fix and document it inline at the call site in `send()`.
+
+/// Map key for a pooled HTTP/2 connection. URL userinfo, path, and query
+/// are intentionally absent — they don't affect TLS reuse.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub(crate) struct PoolKey {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl PoolKey {
+    fn from_request(req: &Request) -> Self {
+        PoolKey {
+            scheme: req.url.scheme.clone(),
+            host: req.url.host.clone(),
+            port: req.url.port,
+        }
+    }
+}
+
+/// Per-authority cap. With h2 multiplexing the steady-state need is small;
+/// keep this modest to bound memory under bursty traffic.
+const POOL_PER_KEY_CAP: usize = 4;
+
+/// Total live pooled conns across all keys.
+const POOL_GLOBAL_CAP: usize = 32;
+
+/// One pooled connection's transport type. We only pool the production
+/// transport — `TlsStream<TcpStream>` over `connect_over_tls`. Test fakes do
+/// not use the pool; the pool tests construct `PoolInner` directly with
+/// `Arc<Mutex<Connection<S>>>` values built from `FakeTls` (i.e. the pool
+/// API is generic over the transport so tests can drive it without I/O).
+type PooledConn<S> = Arc<Mutex<Connection<S>>>;
+
+/// The pool's data is internal: a `HashMap` of vectors of `Arc<Mutex<Conn>>`.
+/// The outer `Mutex<PoolInner>` is held only during the brief map mutations.
+pub(crate) struct PoolInner<S: Read + Write> {
+    entries: HashMap<PoolKey, Vec<PooledConn<S>>>,
+}
+
+impl<S: Read + Write> PoolInner<S> {
+    fn new() -> Self {
+        PoolInner {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Pop one idle conn for `key`, if any. We pop from the back so reuse is
+    /// LIFO: most recently used = most likely still alive on the wire.
+    fn checkout(&mut self, key: &PoolKey) -> Option<PooledConn<S>> {
+        let bucket = self.entries.get_mut(key)?;
+        let conn = bucket.pop();
+        if bucket.is_empty() {
+            self.entries.remove(key);
+        }
+        conn
+    }
+
+    /// Return a conn to the pool. Enforces both caps; on overflow we drop the
+    /// new conn rather than evicting an existing one (a warm conn we've used
+    /// once already is more likely to survive the next request than a fresh
+    /// arrival).
+    fn release(&mut self, key: PoolKey, conn: PooledConn<S>) {
+        // Global cap takes precedence: even if this bucket has room, we
+        // refuse to grow the pool past the global ceiling.
+        let total: usize = self.entries.values().map(Vec::len).sum();
+        if total >= POOL_GLOBAL_CAP {
+            return;
+        }
+        let bucket = self.entries.entry(key).or_default();
+        if bucket.len() >= POOL_PER_KEY_CAP {
+            return;
+        }
+        bucket.push(conn);
+    }
+
+    /// For tests/diagnostics: total number of pooled conns.
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+}
+
+/// Process-global pool of production HTTP/2 connections. `OnceLock` keeps
+/// init lazy and lock-free after the first observed access; the inner
+/// `Mutex` serializes the brief map updates.
+static POOL: OnceLock<Mutex<PoolInner<TlsStream<TcpStream>>>> = OnceLock::new();
+
+fn global_pool() -> &'static Mutex<PoolInner<TlsStream<TcpStream>>> {
+    POOL.get_or_init(|| Mutex::new(PoolInner::new()))
+}
+
+/// Build a brand-new HTTP/2 connection: TCP → TLS (ALPN=h2) → preface.
+/// Used both by `send()` on a cold path and indirectly by anything that
+/// wants a fresh `Connection` (currently no other call sites).
+fn dial_h2(req: &Request) -> Result<Connection<TlsStream<TcpStream>>> {
+    let tcp = tcp_connect(req)?;
+    let opts = crate::http::tls_opts_from(req, &[b"h2"])?;
+    let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
+    if !negotiated_h2 {
+        return Err(Error::H2NotNegotiated);
+    }
+    Connection::new(tls)
+}
+
+/// True if `req`'s TLS options match what the pool can safely reuse. We
+/// refuse to pool when verification is off or a custom CA bundle is set —
+/// see the module comment above the pool definitions for the rationale.
+fn pool_eligible(req: &Request) -> bool {
+    req.verify_tls && req.ca_bundle.is_none()
+}
+
+/// Send a single request/response over an HTTP/2 connection, reusing a
+/// pooled connection for the same `(scheme, host, port)` when possible.
 ///
-/// The connection is built, used for one stream, and dropped. Task 5 will
-/// replace this with a pool-aware variant that reuses connections across
-/// `send()` calls.
+/// Flow:
+///
+/// 1. Build a `PoolKey` and check whether the request's TLS opts are pool-
+///    eligible. Non-default opts (`-k` / `--cacert`) bypass the pool.
+/// 2. On a pool hit, lock the conn's `Mutex`, sanity-check `is_usable`, run
+///    one request on it. On success and still-usable, release back. On any
+///    error during send/drive, drop the conn (its wire position may be
+///    inconsistent — mid-frame, mid-CONTINUATION — and we cannot recover).
+/// 3. On a pool miss, dial a fresh conn, run the request, and release on
+///    success.
 pub fn send(req: Request) -> Result<Response> {
     if req.url.scheme != "https" {
         // h2c (cleartext HTTP/2 with upgrade) is out of scope for v1.
@@ -2005,19 +2177,68 @@ pub fn send(req: Request) -> Result<Response> {
             req.url.scheme
         )));
     }
-    let tcp = tcp_connect(&req)?;
-    let opts = crate::http::tls_opts_from(&req, &[b"h2"])?;
-    let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
-    let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
-    if !negotiated_h2 {
-        return Err(Error::H2NotNegotiated);
+
+    let key = PoolKey::from_request(&req);
+    let eligible = pool_eligible(&req);
+
+    // -------- Pool path --------
+    // We make at most one attempt against a pooled conn. If the pooled
+    // conn turns out to be unusable (or fails mid-request) we fall through
+    // to the cold-dial path below; we don't loop popping more pooled conns,
+    // because in practice a dead pooled conn is almost always the first
+    // symptom of a dead idle pool — better to spend the handshake than
+    // burn through every entry.
+    if eligible {
+        let pooled = {
+            let mut guard = global_pool().lock().expect("pool mutex poisoned");
+            guard.checkout(&key)
+        };
+        if let Some(arc) = pooled {
+            // Hold the per-conn lock for the whole request — sequential
+            // multiplexing only. The pool-wide lock has already been
+            // released.
+            let mut conn_guard = arc.lock().expect("pooled conn mutex poisoned");
+            if conn_guard.is_usable() {
+                match run_one_request(&mut conn_guard, &req) {
+                    Ok(resp) => {
+                        let still_usable = conn_guard.is_usable();
+                        drop(conn_guard);
+                        if still_usable {
+                            let mut guard = global_pool().lock().expect("pool mutex poisoned");
+                            guard.release(key.clone(), arc);
+                        }
+                        return Ok(resp);
+                    }
+                    Err(_e) => {
+                        // Wire state may now be inconsistent. Drop the conn
+                        // and fall through to a cold dial; the original error
+                        // is intentionally discarded in favour of the
+                        // (likely cleaner) error from the fresh attempt.
+                        drop(conn_guard);
+                    }
+                }
+            }
+            // Unusable on checkout: just drop, do not re-pool.
+        }
     }
 
-    let mut conn = Connection::new(tls)?;
+    // -------- Cold-dial path --------
+    let mut fresh = dial_h2(&req)?;
+    let resp = run_one_request(&mut fresh, &req)?;
+    if eligible && fresh.is_usable() {
+        let arc = Arc::new(Mutex::new(fresh));
+        let mut guard = global_pool().lock().expect("pool mutex poisoned");
+        guard.release(key, arc);
+    }
+    Ok(resp)
+}
+
+/// Drive one request/response exchange on an already-established conn.
+/// Factored out so both pool-hit and pool-miss paths share the same body.
+fn run_one_request<S: Read + Write>(conn: &mut Connection<S>, req: &Request) -> Result<Response> {
     let stream_id = conn.open_stream()?;
-    conn.send_request_on(stream_id, &req)?;
+    conn.send_request_on(stream_id, req)?;
     let stream = conn.drive_until_stream_done(stream_id)?;
-    drop(conn);
     build_response_from_stream(stream)
 }
 
@@ -2990,7 +3211,7 @@ mod tests {
             conn_send_window: ConnSendWindow::new(),
             conn_recv_window: ConnRecvWindow::new(),
             decoder: Decoder::new(),
-            streams: std::collections::HashMap::new(),
+            streams: HashMap::new(),
             next_stream_id: 1,
             goaway_received: None,
             expecting_continuation: None,
@@ -3214,6 +3435,113 @@ mod tests {
         };
         let err = conn.process_frame(bad).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Connection pool (task 5). All pool tests use `PoolInner::<FakeTls>`
+    // built directly — they do NOT touch the process-global `POOL` static,
+    // so they are isolated from one another and from any production code.
+    // -----------------------------------------------------------------
+
+    fn fake_arc_conn() -> Arc<Mutex<Connection<FakeTls>>> {
+        Arc::new(Mutex::new(fake_conn()))
+    }
+
+    fn url_key(url: &str) -> PoolKey {
+        let req = Request::new("GET", url).unwrap();
+        PoolKey::from_request(&req)
+    }
+
+    #[test]
+    fn pool_key_round_trip() {
+        // Same URL → equal keys; differing scheme/host/port → distinct.
+        let a = url_key("https://example.com/a");
+        let b = url_key("https://example.com/b"); // path differs only
+        assert_eq!(a, b);
+
+        let c = url_key("https://example.com:8443/a");
+        assert_ne!(a, c, "port differs");
+
+        let d = url_key("https://other.example/a");
+        assert_ne!(a, d, "host differs");
+    }
+
+    #[test]
+    fn pool_checkout_empty_returns_none() {
+        let mut pool: PoolInner<FakeTls> = PoolInner::new();
+        let k = url_key("https://example.com/");
+        assert!(pool.checkout(&k).is_none());
+    }
+
+    #[test]
+    fn pool_release_then_checkout_returns_same_conn() {
+        // Release one Arc, check it back out, assert it's the same allocation.
+        let mut pool: PoolInner<FakeTls> = PoolInner::new();
+        let k = url_key("https://example.com/");
+        let arc = fake_arc_conn();
+        let raw_in = Arc::as_ptr(&arc) as usize;
+        pool.release(k.clone(), arc);
+
+        let got = pool.checkout(&k).expect("checkout after release");
+        let raw_out = Arc::as_ptr(&got) as usize;
+        assert_eq!(raw_in, raw_out, "pool returned a different Arc");
+
+        // Bucket should have been removed once empty.
+        assert!(pool.checkout(&k).is_none());
+    }
+
+    #[test]
+    fn pool_per_key_cap_drops_overflow() {
+        // Release POOL_PER_KEY_CAP + 2 conns to a single key; only CAP
+        // survive. Pop them all and count.
+        let mut pool: PoolInner<FakeTls> = PoolInner::new();
+        let k = url_key("https://example.com/");
+        for _ in 0..(POOL_PER_KEY_CAP + 2) {
+            pool.release(k.clone(), fake_arc_conn());
+        }
+        let mut popped = 0;
+        while pool.checkout(&k).is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, POOL_PER_KEY_CAP);
+    }
+
+    #[test]
+    fn pool_global_cap_drops_overflow() {
+        // Spread releases across many distinct keys so the per-key cap
+        // never bites — only the global cap can. Push double the global cap
+        // and assert the pool's total length never exceeds it.
+        let mut pool: PoolInner<FakeTls> = PoolInner::new();
+        for i in 0..(POOL_GLOBAL_CAP * 2) {
+            let k = url_key(&format!("https://h{i}.example/"));
+            pool.release(k, fake_arc_conn());
+        }
+        assert!(
+            pool.total_len() <= POOL_GLOBAL_CAP,
+            "pool grew past global cap: {} > {}",
+            pool.total_len(),
+            POOL_GLOBAL_CAP
+        );
+        // And we should be exactly at the cap (we never evict, so we should
+        // have stopped accepting at POOL_GLOBAL_CAP).
+        assert_eq!(pool.total_len(), POOL_GLOBAL_CAP);
+    }
+
+    #[test]
+    fn connection_is_usable_false_after_goaway() {
+        let mut conn = fake_conn();
+        conn.goaway_received = Some(0);
+        assert!(
+            conn.streams.is_empty(),
+            "precondition: fresh conn has no streams"
+        );
+        assert!(!conn.is_usable());
+    }
+
+    #[test]
+    fn connection_is_usable_true_initially() {
+        let conn = fake_conn();
+        assert!(conn.is_usable());
     }
 
     #[test]
