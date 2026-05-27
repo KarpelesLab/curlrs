@@ -825,7 +825,8 @@ pub fn send(req: Request) -> Result<Response> {
         )));
     }
     let tcp = tcp_connect(&req)?;
-    let mut tls = crate::tls::connect_over_with_alpn(tcp, &req.url.host, &[b"h2"])?;
+    let opts = crate::http::tls_opts_from(&req, &[b"h2"])?;
+    let mut tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
     if !negotiated_h2 {
         // Server did not accept ALPN "h2". Signal upward so callers (e.g.
@@ -1098,6 +1099,7 @@ fn build_header_block(req: &Request) -> Vec<u8> {
     // Regular headers: lowercased name, skip any banned ones.
     let mut have_ua = false;
     let mut have_accept = false;
+    let mut have_auth = false;
     for (k, v) in &req.headers {
         if is_connection_specific_header(k) || k.eq_ignore_ascii_case("host") {
             continue;
@@ -1109,7 +1111,16 @@ fn build_header_block(req: &Request) -> Vec<u8> {
         if lk == "accept" {
             have_accept = true;
         }
+        if lk == "authorization" {
+            have_auth = true;
+        }
         hpack_encode_header(&mut out, &lk, v);
+    }
+    if !have_auth {
+        if let Some(creds) = crate::http::effective_basic_auth(req) {
+            let value = format!("Basic {creds}");
+            hpack_encode_header(&mut out, "authorization", &value);
+        }
     }
     if !have_ua {
         hpack_encode_header(

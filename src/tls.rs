@@ -22,6 +22,36 @@ const SYSTEM_CA_PATHS: &[&str] = &[
     "/etc/ca-certificates/extracted/tls-ca-bundle.pem", // Arch
 ];
 
+/// Knobs the caller can flip on a single TLS handshake. ALPN list, whether
+/// to verify the chain, and an optional custom root store. Used by
+/// [`connect_over_tls`]; the older [`connect_over`] / [`connect_over_with_alpn`]
+/// wrappers fill this in with defaults.
+#[derive(Default, Clone)]
+pub struct TlsOpts {
+    /// ALPN protocol identifiers to offer (`b"h2"`, `b"http/1.1"`, ...).
+    /// Empty means "don't offer ALPN".
+    pub alpn: Vec<Vec<u8>>,
+    /// When `false`, the chain is accepted without verification — the curl
+    /// `-k` / `--insecure` behaviour. Defaults to `true` via
+    /// [`TlsOpts::verifying`].
+    pub verify: bool,
+    /// Roots to trust. When `None`, [`connect_over_tls`] loads the system
+    /// bundle. When `Some`, that store is used as-is.
+    pub roots: Option<RootCertStore>,
+}
+
+impl TlsOpts {
+    /// Defaults that match the old `connect_over_with_alpn` behaviour:
+    /// verify on, no custom roots, no ALPN.
+    pub fn verifying() -> Self {
+        TlsOpts {
+            alpn: Vec::new(),
+            verify: true,
+            roots: None,
+        }
+    }
+}
+
 /// Load every CA found in the first existing bundle on disk. The bundle is
 /// scanned for PEM blocks; certificates that purecrypto cannot parse (e.g.
 /// unsupported key types) are silently skipped, matching what other
@@ -50,6 +80,27 @@ pub fn load_system_roots() -> Result<RootCertStore> {
     Err(Error::BadResponse(
         "no system CA bundle found; tried common Unix paths".into(),
     ))
+}
+
+/// Load CA certificates from a user-supplied PEM bundle (the `--cacert <file>`
+/// flag in curl). Same parser as [`load_system_roots`], same skip-the-broken
+/// behaviour; an empty bundle is an error so the caller knows verification
+/// would always fail.
+pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
+    let pem = std::fs::read_to_string(path).map_err(Error::Io)?;
+    let mut roots = RootCertStore::new();
+    let mut loaded = 0usize;
+    for block in pem_blocks(&pem) {
+        if roots.add_pem(&block).is_ok() {
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        return Err(Error::BadResponse(format!(
+            "no usable CA certificates parsed from {path}"
+        )));
+    }
+    Ok(roots)
 }
 
 /// Yield each `-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----` block
@@ -89,7 +140,7 @@ pub struct TlsStream<S: Read + Write> {
 /// name is verified against `sni`. ALPN is not offered; use
 /// [`connect_over_with_alpn`] to negotiate a specific application protocol.
 pub fn connect_over<S: Read + Write>(transport: S, sni: &str) -> Result<TlsStream<S>> {
-    connect_over_with_alpn(transport, sni, &[])
+    connect_over_tls(transport, sni, TlsOpts::verifying())
 }
 
 /// Like [`connect_over`], but offers `alpn` as the ALPN protocol list. The
@@ -101,14 +152,29 @@ pub fn connect_over_with_alpn<S: Read + Write>(
     sni: &str,
     alpn: &[&[u8]],
 ) -> Result<TlsStream<S>> {
-    let roots = load_system_roots()?;
+    let mut opts = TlsOpts::verifying();
+    opts.alpn = alpn.iter().map(|p| p.to_vec()).collect();
+    connect_over_tls(transport, sni, opts)
+}
+
+/// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so callers
+/// can disable verification (`-k`) or supply a custom root store (`--cacert`).
+pub fn connect_over_tls<S: Read + Write>(
+    transport: S,
+    sni: &str,
+    opts: TlsOpts,
+) -> Result<TlsStream<S>> {
+    let roots = match opts.roots {
+        Some(r) => r,
+        None => load_system_roots()?,
+    };
     let mut builder = Config::builder()
         .tls_only()
         .roots(roots)
         .server_name(sni.to_string())
-        .verify_certificates(true);
-    if !alpn.is_empty() {
-        builder = builder.alpn(alpn.iter().map(|p| p.to_vec()).collect());
+        .verify_certificates(opts.verify);
+    if !opts.alpn.is_empty() {
+        builder = builder.alpn(opts.alpn);
     }
     let cfg = builder.build();
     let conn = Connection::client(&cfg).map_err(tls_err)?;

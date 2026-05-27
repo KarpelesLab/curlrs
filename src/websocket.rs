@@ -368,8 +368,9 @@ fn random_16() -> [u8; 16] {
 }
 
 /// Standard base64 (RFC 4648 §4) with `=` padding. Hand-rolled so we don't
-/// pull in another dependency for ~30 lines of work.
-fn base64_encode(input: &[u8]) -> String {
+/// pull in another dependency for ~30 lines of work. (Also reused by HTTP
+/// Basic auth in `crate::http`.)
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;

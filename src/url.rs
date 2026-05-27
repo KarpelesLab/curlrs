@@ -103,6 +103,70 @@ impl Url {
     }
 }
 
+/// Resolve a redirect target. `location` may be an absolute URL, a
+/// protocol-relative reference (`//host/...`), an absolute path (`/foo`), or
+/// a relative path (`foo/bar`); we cover the cases that show up in real
+/// `Location:` headers per RFC 9110 §10.2.2. Any fragment on `location` is
+/// stripped before reparsing.
+pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
+    let loc = location.trim();
+    if loc.is_empty() {
+        return Err(Error::InvalidUrl("empty Location".to_string()));
+    }
+
+    // Absolute URL: scheme://...
+    if let Some(idx) = loc.find("://") {
+        let scheme = &loc[..idx];
+        let ok = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
+        if ok {
+            return Url::parse(loc);
+        }
+    }
+
+    // Protocol-relative: //host/path — inherit the base scheme.
+    if let Some(rest) = loc.strip_prefix("//") {
+        let composed = format!("{}://{}", base.scheme, rest);
+        return Url::parse(&composed);
+    }
+
+    // Strip any fragment from the location before composing.
+    let loc_no_frag = match loc.find('#') {
+        Some(i) => &loc[..i],
+        None => loc,
+    };
+
+    let default_p = default_port(&base.scheme).unwrap_or(0);
+    let needs_port = base.port != default_p;
+    let authority = if needs_port {
+        format!("{}:{}", base.host, base.port)
+    } else {
+        base.host.clone()
+    };
+
+    // Absolute-path reference: /foo?bar
+    if loc_no_frag.starts_with('/') {
+        let composed = format!("{}://{}{}", base.scheme, authority, loc_no_frag);
+        return Url::parse(&composed);
+    }
+
+    // Relative path. Drop everything after the last '/' in the base path,
+    // then append. RFC 3986 §5.2.3 — also strip the base's query first.
+    let base_path = base.path.as_str();
+    let base_path_no_query = match base_path.find('?') {
+        Some(i) => &base_path[..i],
+        None => base_path,
+    };
+    let dir = match base_path_no_query.rfind('/') {
+        Some(i) => &base_path_no_query[..=i],
+        None => "/",
+    };
+    let composed = format!("{}://{}{}{}", base.scheme, authority, dir, loc_no_frag);
+    Url::parse(&composed)
+}
+
 /// Default port for every scheme curlrs knows about. Returning `None` means
 /// the scheme is not recognized at all (URL parsing will reject it).
 fn default_port(scheme: &str) -> Option<u16> {
@@ -188,6 +252,77 @@ mod tests {
             let u = Url::parse(&url).unwrap_or_else(|e| panic!("scheme {scheme}: {e}"));
             assert_ne!(u.port, 0, "scheme {scheme} got port 0");
         }
+    }
+
+    #[test]
+    fn resolve_absolute_url() {
+        let base = Url::parse("http://a.example/foo").unwrap();
+        let r = resolve(&base, "https://b.example/bar").unwrap();
+        assert_eq!(r.scheme, "https");
+        assert_eq!(r.host, "b.example");
+        assert_eq!(r.path, "/bar");
+    }
+
+    #[test]
+    fn resolve_protocol_relative() {
+        let base = Url::parse("https://a.example/foo").unwrap();
+        let r = resolve(&base, "//c.example/baz").unwrap();
+        assert_eq!(r.scheme, "https");
+        assert_eq!(r.host, "c.example");
+        assert_eq!(r.path, "/baz");
+    }
+
+    #[test]
+    fn resolve_absolute_path() {
+        let base = Url::parse("http://a.example/foo/bar?q=1").unwrap();
+        let r = resolve(&base, "/quux").unwrap();
+        assert_eq!(r.scheme, "http");
+        assert_eq!(r.host, "a.example");
+        assert_eq!(r.path, "/quux");
+    }
+
+    #[test]
+    fn resolve_relative_path() {
+        let base = Url::parse("http://a.example/foo/bar").unwrap();
+        let r = resolve(&base, "baz").unwrap();
+        assert_eq!(r.path, "/foo/baz");
+    }
+
+    #[test]
+    fn resolve_relative_path_trailing_slash() {
+        let base = Url::parse("http://a.example/foo/").unwrap();
+        let r = resolve(&base, "baz").unwrap();
+        assert_eq!(r.path, "/foo/baz");
+    }
+
+    #[test]
+    fn resolve_preserves_nonstandard_port() {
+        let base = Url::parse("http://a.example:8080/x").unwrap();
+        let r = resolve(&base, "/y").unwrap();
+        assert_eq!(r.host, "a.example");
+        assert_eq!(r.port, 8080);
+        assert_eq!(r.path, "/y");
+    }
+
+    #[test]
+    fn resolve_strips_location_fragment() {
+        let base = Url::parse("http://a.example/").unwrap();
+        let r = resolve(&base, "/path#frag").unwrap();
+        assert_eq!(r.path, "/path");
+    }
+
+    #[test]
+    fn resolve_strips_base_query_for_relative() {
+        // Relative reference should not pick up the base's query string.
+        let base = Url::parse("http://a.example/foo?x=1").unwrap();
+        let r = resolve(&base, "bar").unwrap();
+        assert_eq!(r.path, "/bar");
+    }
+
+    #[test]
+    fn resolve_rejects_empty() {
+        let base = Url::parse("http://a.example/").unwrap();
+        assert!(resolve(&base, "").is_err());
     }
 
     #[test]

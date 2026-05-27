@@ -52,11 +52,21 @@ println!("{}", String::from_utf8_lossy(&resp.body));
 curlrs http://example.com
 curlrs -o out.html -v http://example.com
 curlrs https://example.com               # HTTPS via purecrypto
+curlrs -L http://github.com              # follow redirects
+curlrs -u alice:hunter2 http://api/...   # HTTP Basic auth
+curlrs -k https://expired.badssl.com     # skip TLS verification (insecure!)
+curlrs --cacert ./roots.pem https://...  # custom trust anchors
+curlrs --max-time 5 -O http://e/foo.bin  # cap total time, save as foo.bin
 curlrs file:///etc/hostname              # local file
 curlrs dict://dict.org/d:curl            # dictionary lookup
 curlrs gopher://gopher.floodgap.com/     # gopher menu
 curlrs ftp://ftp.example.com/pub/file    # FTP download
 ```
+
+Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
+`-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--max-time`,
+`--connect-timeout`, and `-O`/`--remote-name`. Multiple URLs on one
+command line are processed sequentially.
 
 ## C usage
 
