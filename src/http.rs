@@ -10,14 +10,17 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// An HTTP request being constructed.
+///
+/// Fields are `pub(crate)` so that protocol-variant modules (`http2`, `http3`)
+/// can read them without going through `&self` accessors.
 #[derive(Debug, Clone)]
 pub struct Request {
-    method: String,
-    url: Url,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    connect_timeout: Option<Duration>,
-    read_timeout: Option<Duration>,
+    pub(crate) method: String,
+    pub(crate) url: Url,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
 }
 
 impl Request {

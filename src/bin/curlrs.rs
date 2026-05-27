@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use curlrs::{Request, Response};
+use curlrs::{Request, Response, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,6 +56,22 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    let parsed_url = match Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("curlrs: {e}");
+            }
+            return ExitCode::from(3);
+        }
+    };
+
+    // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
+    // options (-X, -H, -d, ...) are ignored for them in this milestone.
+    if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
+        return run_transfer(url, &args);
+    }
 
     let method = args
         .method
@@ -189,6 +205,38 @@ fn next_val(
     it.next()
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn run_transfer(url: &str, args: &Args) -> ExitCode {
+    match curlrs::transfer(url) {
+        Ok(bytes) => {
+            let mut out: Box<dyn Write> = match &args.output {
+                Some(path) if path != "-" => match File::create(path) {
+                    Ok(f) => Box::new(f),
+                    Err(e) => {
+                        if !args.silent {
+                            eprintln!("curlrs: open {path}: {e}");
+                        }
+                        return ExitCode::from(23);
+                    }
+                },
+                _ => Box::new(io::stdout().lock()),
+            };
+            if let Err(e) = out.write_all(&bytes) {
+                if !args.silent {
+                    eprintln!("curlrs: write error: {e}");
+                }
+                return ExitCode::from(23);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if !args.silent {
+                eprintln!("curlrs: {e}");
+            }
+            ExitCode::from(7)
+        }
+    }
 }
 
 fn write_output(resp: &Response, args: &Args) -> io::Result<()> {

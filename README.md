@@ -18,8 +18,19 @@ Early, in active development.
 | HTTP/1.1 GET | working |
 | HTTP/1.1 other methods | working (basic) |
 | HTTPS via purecrypto | working (TLS 1.2/1.3, system roots, cert verification) |
-| FTP / FTPS | planned |
-| HTTP/2, HTTP/3 | not yet |
+| HTTP/2 (RFC 9113) | scaffolded |
+| HTTP/3 over QUIC (RFC 9114) | scaffolded |
+| FTP / FTPS (RFC 959, 4217) | scaffolded |
+| FILE (RFC 8089) | scaffolded |
+| DICT (RFC 2229) | scaffolded |
+| GOPHER / GOPHERS (RFC 1436) | scaffolded |
+| IMAP / IMAPS (RFC 9051) | scaffolded |
+| LDAP / LDAPS (RFC 4511) | scaffolded |
+| MQTT / MQTTS (v3.1.1) | scaffolded |
+| POP3 / POP3S (RFC 1939) | scaffolded |
+| RTSP (RFC 7826) | scaffolded |
+| TFTP (RFC 1350) | scaffolded |
+| WS / WSS (RFC 6455) | scaffolded |
 
 System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
 `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem`,
