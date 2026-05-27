@@ -8,6 +8,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 mod compress;
+mod cookie;
 mod error;
 mod http;
 mod transfer;
@@ -32,6 +33,7 @@ pub mod websocket;
 
 pub mod ffi;
 
+pub use crate::cookie::{Cookie, CookieJar};
 pub use crate::error::{Error, Result};
 pub use crate::http::{HttpVersionPref, Request, Response};
 pub use crate::transfer::{transfer, transfer_url};

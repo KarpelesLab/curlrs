@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{BodyMode, Request as SReq, Response as SResp, TestServer};
 
-use rsurl::{Error, Request};
+use rsurl::{CookieJar, Error, Request};
 
 /// 200 OK with a Content-Length-framed body — the cheapest possible
 /// round-trip.
@@ -358,5 +358,96 @@ fn connect_refused_is_io_error() {
     assert!(
         matches!(err, Error::Io(_)),
         "expected Error::Io, got {err:?}",
+    );
+}
+
+/// Set-Cookie on a 200 response populates the jar.
+#[test]
+fn set_cookie_lands_in_jar() {
+    let server =
+        TestServer::start(|_req: SReq| SResp::ok("ok").header("Set-Cookie", "sid=abc; Path=/"));
+    let mut jar = CookieJar::new();
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .send_with_jar(&mut jar)
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(jar.len(), 1, "expected one cookie, jar={jar:?}");
+    let url = rsurl::Url::parse(&server.url("/")).unwrap();
+    assert_eq!(jar.cookie_header(&url).as_deref(), Some("sid=abc"));
+}
+
+/// A 302 with Set-Cookie sets a cookie, and the chased follow-up GET must
+/// carry that cookie in its request header.
+#[test]
+fn cookie_traverses_redirect_chain() {
+    use std::sync::{Arc, Mutex};
+    // Shared slot the /home handler writes the Cookie header value into,
+    // so the test body can assert what was sent on hop #2.
+    let observed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let obs_for_handler = Arc::clone(&observed);
+
+    let server = TestServer::start(move |req: SReq| {
+        if req.path == "/start" {
+            // Issue a cookie and redirect.
+            SResp::status(302)
+                .header("Set-Cookie", "sid=abc; Path=/")
+                .header("Location", "/home")
+        } else if req.path == "/home" {
+            // Capture whatever Cookie: header arrived on the second hop.
+            let got = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                .map(|(_, v)| v.clone());
+            *obs_for_handler.lock().unwrap() = got;
+            SResp::ok("welcome")
+        } else {
+            SResp::status(404)
+        }
+    });
+
+    let mut jar = CookieJar::new();
+    let resp = Request::get(&server.url("/start"))
+        .unwrap()
+        .follow_redirects(true)
+        .send_with_jar(&mut jar)
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"welcome");
+    let cookie_seen = observed.lock().unwrap().clone();
+    assert_eq!(
+        cookie_seen.as_deref(),
+        Some("sid=abc"),
+        "expected sid=abc on the redirected hop, got {cookie_seen:?}",
+    );
+}
+
+/// `send_with_jar` without any Set-Cookie response leaves the jar empty
+/// and never inserts a stray `Cookie:` request header.
+#[test]
+fn jar_is_empty_when_server_sets_no_cookie() {
+    use std::sync::{Arc, Mutex};
+    let observed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let obs = Arc::clone(&observed);
+    let server = TestServer::start(move |req: SReq| {
+        let got = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.clone());
+        *obs.lock().unwrap() = got;
+        SResp::ok("ok")
+    });
+    let mut jar = CookieJar::new();
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .send_with_jar(&mut jar)
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert!(jar.is_empty(), "jar should be empty");
+    assert!(
+        observed.lock().unwrap().is_none(),
+        "should not have sent any Cookie: header"
     );
 }

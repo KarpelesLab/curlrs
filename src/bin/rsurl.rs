@@ -22,6 +22,8 @@
 //!         --connect-timeout    cap on the TCP connect step
 //!         --http2              require HTTP/2 (ALPN h2); error if unavailable
 //!         --http1.1            force HTTP/1.1 (alias: --http1)
+//!     -b, --cookie <data>      cookies: "k=v[; k=v]" or a Netscape file path
+//!     -c, --cookie-jar <file>  write all known cookies to <file> on exit
 //!     -h, --help               print help
 //!     -V, --version            print version
 
@@ -31,7 +33,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rsurl::{HttpVersionPref, Request, Response, Url};
+use rsurl::{CookieJar, HttpVersionPref, Request, Response, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -60,6 +62,13 @@ struct Args {
     max_time: Option<u64>,
     connect_timeout: Option<u64>,
     remote_name: bool,
+    /// Argument to `-b`/`--cookie`. Either explicit `k=v[; k=v]...` cookie
+    /// data (detected by the presence of `=`) or a Netscape `cookies.txt`
+    /// file path. Mirrors curl's behaviour.
+    cookie_in: Option<String>,
+    /// Argument to `-c`/`--cookie-jar`. After all transfers complete, the
+    /// jar is written to this path in Netscape `cookies.txt` format.
+    cookie_jar: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -78,19 +87,96 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Cookie jar: built once and shared across every URL on the command
+    // line, so Set-Cookie from URL N is visible to URL N+1, just like curl.
+    // We only allocate one if the user asked for cookie behaviour.
+    let mut jar: Option<CookieJar> = match build_initial_jar(&args) {
+        Ok(j) => j,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            return ExitCode::from(2);
+        }
+    };
+
     // Run each URL; remember the last non-zero code (matches curl's
     // behaviour of returning the most recent error).
     let mut last_failure: u8 = 0;
     for url in &args.urls {
-        let code = process_url(url, &args);
+        let code = process_url(url, &args, jar.as_mut());
         if code != 0 {
             last_failure = code;
+        }
+    }
+
+    // Final save (after every transfer) so cookies set on the last hop
+    // make it to disk. Failure here is reported but does not override an
+    // earlier non-zero exit code — curl behaves the same way.
+    if let (Some(j), Some(path)) = (jar.as_ref(), args.cookie_jar.as_deref()) {
+        if let Err(e) = j.save_netscape(path) {
+            if !args.silent {
+                eprintln!("rsurl: writing cookie jar {path}: {e}");
+            }
+            if last_failure == 0 {
+                last_failure = 23;
+            }
         }
     }
     ExitCode::from(last_failure)
 }
 
-fn process_url(url: &str, args: &Args) -> u8 {
+/// Build the initial jar from `-b`/`-c`.
+///
+/// * Neither flag → `None`.
+/// * `-b k=v[; k=v]...` (contains `=`) → empty jar; the explicit cookies
+///   are applied per-URL in [`process_url`] so each one gets the right host.
+/// * `-b <file>` (no `=`) → load Netscape file. Missing file is silently
+///   accepted (matches curl: a fresh jar that will be written by `-c`).
+/// * `-c <file>` alone → empty jar; cookies received during the run are
+///   saved at the end.
+fn build_initial_jar(args: &Args) -> Result<Option<CookieJar>, String> {
+    if args.cookie_in.is_none() && args.cookie_jar.is_none() {
+        return Ok(None);
+    }
+    let mut jar = match args.cookie_in.as_deref() {
+        Some(s) if !s.contains('=') => CookieJar::load_netscape_or_empty(s)
+            .map_err(|e| format!("reading cookie file {s}: {e}"))?,
+        _ => CookieJar::new(),
+    };
+    // If only `-c` was given (no `-b`), and the destination already exists,
+    // curl pre-populates the jar from it so cookies aren't dropped. We
+    // mirror that by reading the file when it's there — missing is fine.
+    if args.cookie_in.is_none() {
+        if let Some(path) = args.cookie_jar.as_deref() {
+            jar = CookieJar::load_netscape_or_empty(path)
+                .map_err(|e| format!("reading cookie file {path}: {e}"))?;
+        }
+    }
+    Ok(Some(jar))
+}
+
+/// Apply explicit `-b "k=v; k2=v2"` cookies to the jar for `request_url`'s
+/// host. Curl's behaviour is that command-line cookies are session-only and
+/// apply on the requests issued by that invocation; we keep that by routing
+/// through [`CookieJar::add_explicit`].
+fn apply_explicit_cookies(jar: &mut CookieJar, data: &str, request_url: &Url) {
+    for pair in data.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() {
+                jar.add_explicit(k, v, request_url);
+            }
+        }
+    }
+}
+
+fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     let parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
@@ -175,11 +261,26 @@ fn process_url(url: &str, args: &Args) -> u8 {
         req = req.connect_timeout(Duration::from_secs(secs));
     }
 
-    let send_result = if args.verbose {
-        let mut err = io::stderr().lock();
-        req.send_traced(&mut err)
-    } else {
-        req.send()
+    // If `-b "k=v"` was given, apply those cookies to the jar against the
+    // current URL before issuing the request. This must happen before the
+    // send_*_with_jar call below, which moves the jar reference.
+    if let (Some(j), Some(data)) = (jar.as_deref_mut(), args.cookie_in.as_deref()) {
+        if data.contains('=') {
+            apply_explicit_cookies(j, data, &parsed_url);
+        }
+    }
+
+    let send_result = match (jar, args.verbose) {
+        (Some(j), true) => {
+            let mut err = io::stderr().lock();
+            req.send_traced_with_jar(j, &mut err)
+        }
+        (Some(j), false) => req.send_with_jar(j),
+        (None, true) => {
+            let mut err = io::stderr().lock();
+            req.send_traced(&mut err)
+        }
+        (None, false) => req.send(),
     };
     let resp = match send_result {
         Ok(r) => r,
@@ -279,6 +380,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 );
             }
             "-O" | "--remote-name" => a.remote_name = true,
+            "-b" | "--cookie" => a.cookie_in = Some(next_val(&mut it, arg)?),
+            "-c" | "--cookie-jar" => a.cookie_jar = Some(next_val(&mut it, arg)?),
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -401,6 +504,9 @@ Options:
                            cap on the TCP connect step
       --http2              require HTTP/2 (ALPN h2); error if unavailable
       --http1.1            force HTTP/1.1 (alias: --http1)
+  -b, --cookie <data>      cookies to send: \"k=v[; k2=v2]\" or path to a
+                           Netscape cookies.txt file
+  -c, --cookie-jar <file>  write all known cookies to <file> on exit
   -h, --help               print this help
   -V, --version            print version
 "

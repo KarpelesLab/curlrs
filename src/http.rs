@@ -164,7 +164,7 @@ impl Request {
     }
 
     pub fn send(self) -> Result<Response> {
-        self.send_to(&mut io::sink())
+        self.send_to(&mut io::sink(), None)
     }
 
     /// Like [`send`](Self::send), but writes a curl-style `-v` trace to
@@ -174,7 +174,25 @@ impl Request {
     /// trace is built from the same buffers used for I/O, so it cannot
     /// drift from what was sent.
     pub fn send_traced(self, trace: &mut dyn Write) -> Result<Response> {
-        self.send_to(trace)
+        self.send_to(trace, None)
+    }
+
+    /// Send with cookie support. The jar is consulted before each hop to
+    /// inject a `Cookie:` header matching the destination URL, and is
+    /// updated with every `Set-Cookie:` line in each response — including
+    /// cookies set on intermediate redirect responses. Equivalent to curl's
+    /// `-b`/`-c` machinery.
+    pub fn send_with_jar(self, jar: &mut crate::cookie::CookieJar) -> Result<Response> {
+        self.send_to(&mut io::sink(), Some(jar))
+    }
+
+    /// Combination of [`Self::send_traced`] and [`Self::send_with_jar`].
+    pub fn send_traced_with_jar(
+        self,
+        jar: &mut crate::cookie::CookieJar,
+        trace: &mut dyn Write,
+    ) -> Result<Response> {
+        self.send_to(trace, Some(jar))
     }
 
     /// Single-shot send with no redirect handling. Pure protocol dispatch.
@@ -192,7 +210,16 @@ impl Request {
     /// Send the request, then walk through `3xx Location` chains if
     /// [`Self::follow_redirects`] is on. Public users go through
     /// [`Self::send`] / [`Self::send_traced`], which call this.
-    fn send_to(self, trace: &mut dyn Write) -> Result<Response> {
+    ///
+    /// `jar`, when present, is consulted before each hop to attach a
+    /// matching `Cookie:` header and is updated from each response's
+    /// `Set-Cookie:` lines — including those on the intermediate 3xx hops
+    /// the redirect chain walks through.
+    fn send_to(
+        self,
+        trace: &mut dyn Write,
+        mut jar: Option<&mut crate::cookie::CookieJar>,
+    ) -> Result<Response> {
         let mut req = self;
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
@@ -204,8 +231,24 @@ impl Request {
                     return Err(Error::BadResponse("operation timed out".into()));
                 }
             }
-            let snapshot = req.clone();
+            let mut snapshot = req.clone();
+            // Jar-managed Cookie: header. We always strip prior Cookie:
+            // entries from the snapshot before re-injecting from the jar,
+            // because the previous hop's cookie line is stale once the URL
+            // (and thus the matching set) has changed.
+            if let Some(j) = jar.as_deref_mut() {
+                j.purge_expired();
+                snapshot
+                    .headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+                if let Some(val) = j.cookie_header(&snapshot.url) {
+                    snapshot.headers.push(("Cookie".to_string(), val));
+                }
+            }
             let resp = snapshot.send_once(trace)?;
+            if let Some(j) = jar.as_deref_mut() {
+                j.ingest_response(&req.url, &resp.headers);
+            }
             if !req.follow_redirects || !is_redirect_status(resp.status) {
                 return Ok(resp);
             }
