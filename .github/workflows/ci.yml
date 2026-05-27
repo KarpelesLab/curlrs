@@ -39,8 +39,12 @@ jobs:
       - name: Clippy (all features, warnings denied)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test (all features)
-        run: cargo test --all-features
+      - name: Test (all features, release)
+        # `--release` so the integration tests in tests/ (which spin up a
+        # local HTTP/1.1 server and round-trip real bytes through curlrs)
+        # exercise the same code paths CI ships. The unit tests are cheap
+        # enough that running them in release adds no meaningful time.
+        run: cargo test --release --all-features
 
   c_abi:
     name: C ABI smoke test
@@ -59,11 +63,21 @@ jobs:
           cargo rustc --lib --release --crate-type staticlib
           cargo rustc --lib --release --crate-type cdylib
 
-      - name: Compile and run the C smoke test
+      - name: Compile and run the C smoke test (static link)
         run: |
           cc tests/ffi_smoke.c -I include target/release/libcurlrs.a \
-             -lpthread -ldl -lm -o ffi_smoke
-          ./ffi_smoke
+             -lpthread -ldl -lm -o ffi_smoke_static
+          ./ffi_smoke_static
+
+      - name: Compile and run the C smoke test (shared link)
+        # Same source, linked against the cdylib instead of the staticlib.
+        # LD_LIBRARY_PATH points the loader at target/release so the
+        # binary can find libcurlrs.so at run time without installing it.
+        run: |
+          cc tests/ffi_smoke.c -I include \
+             -L target/release -lcurlrs \
+             -o ffi_smoke_shared
+          LD_LIBRARY_PATH=target/release ./ffi_smoke_shared
 
   docs:
     name: Docs build (warnings denied)
