@@ -977,8 +977,12 @@ pub fn send(req: Request) -> Result<Response> {
 /// Build the QUIC client connection with the right transport-parameter set
 /// for HTTP/3.
 fn build_client(req: &Request) -> Result<QuicConnection> {
-    // Reuse the same system-root loading the HTTP/1.x TLS path uses.
-    let roots = crate::tls::load_system_roots()?;
+    // QUIC is built on `purecrypto::quic`, which in turn needs a
+    // `purecrypto::tls::Config` — so even when the `rustls-tls` feature has
+    // pointed the public `crate::tls::*` API at rustls, HTTP/3 still loads
+    // its trust anchors through purecrypto. Going through `pc_roots` directly
+    // sidesteps the active backend.
+    let roots = crate::tls::pc_roots::load_system_roots()?;
     let tls = purecrypto::tls::Config::builder()
         .tls_only()
         .roots(roots)

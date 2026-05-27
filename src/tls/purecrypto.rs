@@ -1,26 +1,21 @@
-//! TLS support, layered on purecrypto's sans-I/O `Connection` state machine.
+//! TLS backend layered on purecrypto's sans-I/O `Connection` state machine.
 //!
 //! Exposes [`TlsStream`], a blocking `Read + Write` adapter that runs the TLS
 //! handshake on construction and then transparently encrypts/decrypts
-//! application bytes on every read/write.
+//! application bytes on every read/write. Selected by the `purecrypto-tls`
+//! Cargo feature (the default); see [`crate::tls`] for the cfg cascade.
 
 use std::io::{self, Read, Write};
 
-use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
+use purecrypto::tls::{Config, Connection, HandshakeStatus};
 
+use super::common::ProtocolVersion;
+use super::pc_roots;
 use crate::error::{Error, Result};
 
-const READ_CHUNK: usize = 16 * 1024;
+pub use purecrypto::tls::RootCertStore;
 
-/// Search paths for a system-wide CA bundle, in order of preference.
-/// Mirrors what curl/OpenSSL look at on common Unix distros.
-const SYSTEM_CA_PATHS: &[&str] = &[
-    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Gentoo
-    "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL
-    "/etc/ssl/cert.pem",                  // Alpine, OpenBSD, macOS (via brew)
-    "/etc/ssl/ca-bundle.pem",             // openSUSE
-    "/etc/ca-certificates/extracted/tls-ca-bundle.pem", // Arch
-];
+const READ_CHUNK: usize = 16 * 1024;
 
 /// Knobs the caller can flip on a single TLS handshake. ALPN list, whether
 /// to verify the chain, and an optional custom root store. Used by
@@ -52,74 +47,18 @@ impl TlsOpts {
     }
 }
 
-/// Load every CA found in the first existing bundle on disk. The bundle is
-/// scanned for PEM blocks; certificates that purecrypto cannot parse (e.g.
-/// unsupported key types) are silently skipped, matching what other
-/// pure-Rust TLS stacks do.
+/// Load every CA found in the first existing bundle on disk. Thin wrapper
+/// around the always-compiled purecrypto-flavoured loader in
+/// [`super::pc_roots`], so the QUIC/HTTP/3 path and this backend stay in
+/// agreement about which paths are searched and how PEM is parsed.
 pub fn load_system_roots() -> Result<RootCertStore> {
-    for path in SYSTEM_CA_PATHS {
-        let pem = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::Io(e)),
-        };
-        let mut roots = RootCertStore::new();
-        let mut loaded = 0usize;
-        for block in pem_blocks(&pem) {
-            if roots.add_pem(&block).is_ok() {
-                loaded += 1;
-            }
-        }
-        if loaded == 0 {
-            return Err(Error::BadResponse(format!(
-                "no usable CA certificates parsed from {path}"
-            )));
-        }
-        return Ok(roots);
-    }
-    Err(Error::BadResponse(
-        "no system CA bundle found; tried common Unix paths".into(),
-    ))
+    pc_roots::load_system_roots()
 }
 
 /// Load CA certificates from a user-supplied PEM bundle (the `--cacert <file>`
-/// flag in curl). Same parser as [`load_system_roots`], same skip-the-broken
-/// behaviour; an empty bundle is an error so the caller knows verification
-/// would always fail.
+/// flag in curl). Thin wrapper around [`super::pc_roots::load_from_file`].
 pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
-    let pem = std::fs::read_to_string(path).map_err(Error::Io)?;
-    let mut roots = RootCertStore::new();
-    let mut loaded = 0usize;
-    for block in pem_blocks(&pem) {
-        if roots.add_pem(&block).is_ok() {
-            loaded += 1;
-        }
-    }
-    if loaded == 0 {
-        return Err(Error::BadResponse(format!(
-            "no usable CA certificates parsed from {path}"
-        )));
-    }
-    Ok(roots)
-}
-
-/// Yield each `-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----` block
-/// from a PEM string as its own string.
-fn pem_blocks(pem: &str) -> Vec<String> {
-    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
-    const END: &str = "-----END CERTIFICATE-----";
-    let mut out = Vec::new();
-    let mut rest = pem;
-    while let Some(start) = rest.find(BEGIN) {
-        let after_begin = &rest[start..];
-        let Some(end_rel) = after_begin.find(END) else {
-            break;
-        };
-        let end_abs = start + end_rel + END.len();
-        out.push(rest[start..end_abs].to_string());
-        rest = &rest[end_abs..];
-    }
-    out
+    pc_roots::load_from_file(path)
 }
 
 /// A blocking TLS adapter around a transport `S: Read + Write` plus a
@@ -190,9 +129,11 @@ pub fn connect_over_tls<S: Read + Write>(
 }
 
 impl<S: Read + Write> TlsStream<S> {
-    /// TLS version negotiated during the handshake, if it succeeded.
-    pub fn negotiated_version(&self) -> Option<purecrypto::tls::ProtocolVersion> {
-        self.conn.negotiated_version()
+    /// TLS version negotiated during the handshake, if it succeeded. Mapped
+    /// from `purecrypto::tls::ProtocolVersion` to the backend-neutral
+    /// [`ProtocolVersion`] so callers don't have to name the purecrypto type.
+    pub fn negotiated_version(&self) -> Option<ProtocolVersion> {
+        self.conn.negotiated_version().map(map_pc_version)
     }
 
     /// ALPN protocol the server selected, or `None` if ALPN was not negotiated.
@@ -320,27 +261,23 @@ impl<S: Read + Write> Read for TlsStream<S> {
     }
 }
 
+fn map_pc_version(v: purecrypto::tls::ProtocolVersion) -> ProtocolVersion {
+    use purecrypto::tls::ProtocolVersion as P;
+    match v {
+        P::TLSv1_2 => ProtocolVersion::TLSv1_2,
+        P::TLSv1_3 => ProtocolVersion::TLSv1_3,
+        // Anything else (old TLS, DTLS, unknown) gets surfaced via the
+        // on-wire two-byte code so the diagnostic still prints something
+        // useful; the trace in `src/http.rs` only ever displays this with
+        // `{v:?}` so an `Other(0x0301)` is fine.
+        other => ProtocolVersion::Other(other.as_u16()),
+    }
+}
+
 fn tls_err(e: purecrypto::tls::Error) -> Error {
     Error::BadResponse(format!("tls: {e:?}"))
 }
 
 fn io_tls(e: purecrypto::tls::Error) -> io::Error {
     io::Error::other(format!("tls: {e:?}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pem_blocks_splits() {
-        let pem = "junk\n\
-            -----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n\
-            noise\n\
-            -----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n";
-        let blocks = pem_blocks(pem);
-        assert_eq!(blocks.len(), 2);
-        assert!(blocks[0].contains("AAA"));
-        assert!(blocks[1].contains("BBB"));
-    }
 }
