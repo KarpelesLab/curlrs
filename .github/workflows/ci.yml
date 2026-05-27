@@ -59,9 +59,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build the C library (static + shared)
-        run: |
-          cargo rustc --lib --release --crate-type staticlib
-          cargo rustc --lib --release --crate-type cdylib
+        # Cargo.toml declares crate-type = ["rlib", "cdylib", "staticlib"],
+        # so a plain release build produces librsurl.a and librsurl.so.
+        run: cargo build --release
 
       - name: Compile and run the C smoke test (static link)
         run: |

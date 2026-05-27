@@ -13,7 +13,7 @@ categories = ["network-programming", "web-programming::http-client", "command-li
 
 [lib]
 name = "rsurl"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
 name = "rsurl"
