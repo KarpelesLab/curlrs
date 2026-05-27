@@ -186,16 +186,15 @@ fn open_passive<R: Read + Write>(
     send(ctrl, "EPSV")?;
     let (c, m) = read_reply(ctrl)?;
     if c == 229 {
-        let port = parse_epsv(&m).ok_or_else(|| {
-            Error::BadResponse(format!("ftp EPSV: cannot parse reply: {m}"))
-        })?;
+        let port = parse_epsv(&m)
+            .ok_or_else(|| Error::BadResponse(format!("ftp EPSV: cannot parse reply: {m}")))?;
         // EPSV doesn't carry a host; reuse the control connection's host
         // (which is also what curl/RFC 2428 says clients should do).
         return Ok((fallback_host.to_string(), port));
     }
     // 5xx → not supported, try PASV. 4xx → transient, but we still try
     // PASV: nothing in the EPSV failure precludes PASV working.
-    if !(c >= 400 && c < 600) {
+    if !(400..600).contains(&c) {
         return Err(Error::BadResponse(format!("ftp EPSV: {c} {m}")));
     }
     send(ctrl, "PASV")?;
@@ -426,8 +425,7 @@ mod tests {
     fn pasv_parses_with_prefix_code_text() {
         // We pass `parse_pasv` only the text part (no code), matching how
         // `read_reply` returns things.
-        let (host, port) =
-            parse_pasv("Entering Passive Mode (192,168,1,2,200,100).").unwrap();
+        let (host, port) = parse_pasv("Entering Passive Mode (192,168,1,2,200,100).").unwrap();
         assert_eq!(host, "192.168.1.2");
         assert_eq!(port, 200 * 256 + 100);
     }

@@ -190,19 +190,13 @@ fn select_mailbox<S: ImapIo>(
 
 fn require_ok(resp: &str, tag: &str, what: &str) -> Result<()> {
     // The tagged response is the last non-empty line. Status word follows the tag.
-    let last = resp
-        .lines()
-        .rev()
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
+    let last = resp.lines().rev().find(|l| !l.is_empty()).unwrap_or("");
     let rest = last.strip_prefix(tag).unwrap_or("").trim_start();
     let status = rest.split_whitespace().next().unwrap_or("");
     if status.eq_ignore_ascii_case("OK") {
         Ok(())
     } else {
-        Err(Error::BadResponse(format!(
-            "imap {what} failed: {last}"
-        )))
+        Err(Error::BadResponse(format!("imap {what} failed: {last}")))
     }
 }
 
@@ -480,10 +474,7 @@ mod tests {
         // `a\b`     → `"a\\b"`
         assert_eq!(quote_imap_string("a\\b"), "\"a\\\\b\"");
         // mixed
-        assert_eq!(
-            quote_imap_string("p\\a\"ss"),
-            "\"p\\\\a\\\"ss\""
-        );
+        assert_eq!(quote_imap_string("p\\a\"ss"), "\"p\\\\a\\\"ss\"");
     }
 
     #[test]
@@ -513,10 +504,7 @@ mod tests {
     #[test]
     fn parse_path_mailbox_only() {
         assert_eq!(parse_path("/INBOX"), (Some("INBOX".into()), None));
-        assert_eq!(
-            parse_path("/Stuff/Sub"),
-            (Some("Stuff/Sub".into()), None)
-        );
+        assert_eq!(parse_path("/Stuff/Sub"), (Some("Stuff/Sub".into()), None));
     }
 
     #[test]
@@ -546,14 +534,8 @@ mod tests {
     #[test]
     fn parse_path_percent_decodes_mailbox() {
         // `%20` → space, `%2F` → `/`
-        assert_eq!(
-            parse_path("/My%20Mail"),
-            (Some("My Mail".into()), None)
-        );
-        assert_eq!(
-            parse_path("/a%2Fb;UID=1"),
-            (Some("a/b".into()), Some(1))
-        );
+        assert_eq!(parse_path("/My%20Mail"), (Some("My Mail".into()), None));
+        assert_eq!(parse_path("/a%2Fb;UID=1"), (Some("a/b".into()), Some(1)));
     }
 
     // -- literal-length detection -----------------------------------------

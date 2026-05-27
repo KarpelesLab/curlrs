@@ -188,7 +188,9 @@ impl<'a> BerReader<'a> {
         }
         let n = (first & 0x7f) as usize;
         if n == 0 {
-            return Err(Error::BadResponse("ber: indefinite length not allowed".into()));
+            return Err(Error::BadResponse(
+                "ber: indefinite length not allowed".into(),
+            ));
         }
         if n > std::mem::size_of::<usize>() {
             return Err(Error::BadResponse("ber: length too large".into()));
@@ -386,7 +388,10 @@ struct FilterParser<'a> {
 
 impl<'a> FilterParser<'a> {
     fn new(s: &'a str) -> Self {
-        FilterParser { bytes: s.as_bytes(), pos: 0 }
+        FilterParser {
+            bytes: s.as_bytes(),
+            pos: 0,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -488,7 +493,10 @@ impl<'a> FilterParser<'a> {
                 "filter: substring matches not supported".into(),
             ));
         }
-        Ok(Filter::EqualityMatch { attr, value: value_raw })
+        Ok(Filter::EqualityMatch {
+            attr,
+            value: value_raw,
+        })
     }
 }
 
@@ -601,8 +609,8 @@ fn read_message(t: &mut Transport) -> Result<Vec<u8>> {
         let mut lb = [0u8; 8];
         read_exact(t, &mut lb[..n])?;
         let mut acc = 0usize;
-        for i in 0..n {
-            acc = (acc << 8) | lb[i] as usize;
+        for b in &lb[..n] {
+            acc = (acc << 8) | *b as usize;
         }
         acc
     };
@@ -689,8 +697,13 @@ fn parse_ldap_result(body: &[u8]) -> Result<(i64, String)> {
     Ok((rc, diag_s))
 }
 
-/// Parse one SearchResultEntry into (dn, [(attr, [val, ...])]).
-fn parse_search_entry(body: &[u8]) -> Result<(String, Vec<(String, Vec<Vec<u8>>)>)> {
+/// (attribute-name, list-of-values).
+type LdapAttr = (String, Vec<Vec<u8>>);
+/// One LDAP search-result entry: distinguished name and its attributes.
+type SearchEntry = (String, Vec<LdapAttr>);
+
+/// Parse one SearchResultEntry into its DN and attribute list.
+fn parse_search_entry(body: &[u8]) -> Result<SearchEntry> {
     let mut r = BerReader::new(body);
     let dn_bytes = r.read_octet_string()?;
     let dn = String::from_utf8_lossy(dn_bytes).into_owned();
@@ -764,9 +777,8 @@ fn ldif_is_safe(value: &[u8]) -> bool {
 
 /// Tiny RFC 4648 base64 encoder. We don't pull in another dep.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
         let b0 = input[i];
@@ -912,10 +924,7 @@ fn split_message(body: &[u8]) -> Result<(i64, u8, &[u8])> {
 
 fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
     use std::net::ToSocketAddrs;
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .map_err(Error::Io)?
-        .collect();
+    let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(Error::Io)?.collect();
     let mut last_err: Option<std::io::Error> = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -924,7 +933,7 @@ fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
         }
     }
     Err(Error::Io(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "no addresses resolved")
+        std::io::Error::other("no addresses resolved")
     })))
 }
 
@@ -1134,7 +1143,7 @@ mod tests {
         assert_eq!(sr.read_enumerated_i64().unwrap(), 0); // never deref
         assert_eq!(sr.read_integer_i64().unwrap(), 100); // sizeLimit
         assert_eq!(sr.read_integer_i64().unwrap(), 30); // timeLimit
-        // typesOnly boolean
+                                                        // typesOnly boolean
         let bool_tlv = sr.read_tlv().unwrap();
         assert_eq!(bool_tlv.tag, tag::BOOLEAN);
         assert_eq!(bool_tlv.value, &[0x00]);

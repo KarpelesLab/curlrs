@@ -9,9 +9,9 @@
 //!
 //! This is a **scaffold** implementation. The pieces present and tested are:
 //!
-//! * RFC 9000 §16 variable-length integer codec ([`varint`]).
-//! * RFC 9114 §7.1 frame-header codec ([`Frame`]).
-//! * RFC 9204 Appendix A QPACK static table ([`qpack::STATIC_TABLE`])
+//! * RFC 9000 §16 variable-length integer codec (`varint`).
+//! * RFC 9114 §7.1 frame-header codec (`Frame`).
+//! * RFC 9204 Appendix A QPACK static table (`qpack::STATIC_TABLE`)
 //!   with a literal-only encoder and a decoder that handles literal
 //!   (non-Huffman) field lines plus indexed static-name lines.
 //! * A [`send`] function that wires a [`purecrypto::quic::QuicConnection`]
@@ -215,108 +215,114 @@ pub(crate) mod qpack {
     /// Indexed by the absolute static index; tuples are `(name, value)`.
     /// Entries with an empty `value` slot are name-only references.
     pub static STATIC_TABLE: &[(&str, &str)] = &[
-        (":authority", ""),                                                                  // 0
-        (":path", "/"),                                                                      // 1
-        ("age", "0"),                                                                        // 2
-        ("content-disposition", ""),                                                         // 3
-        ("content-length", "0"),                                                             // 4
-        ("cookie", ""),                                                                      // 5
-        ("date", ""),                                                                        // 6
-        ("etag", ""),                                                                        // 7
-        ("if-modified-since", ""),                                                           // 8
-        ("if-none-match", ""),                                                               // 9
-        ("last-modified", ""),                                                               // 10
-        ("link", ""),                                                                        // 11
-        ("location", ""),                                                                    // 12
-        ("referer", ""),                                                                     // 13
-        ("set-cookie", ""),                                                                  // 14
-        (":method", "CONNECT"),                                                              // 15
-        (":method", "DELETE"),                                                               // 16
-        (":method", "GET"),                                                                  // 17
-        (":method", "HEAD"),                                                                 // 18
-        (":method", "OPTIONS"),                                                              // 19
-        (":method", "POST"),                                                                 // 20
-        (":method", "PUT"),                                                                  // 21
-        (":scheme", "http"),                                                                 // 22
-        (":scheme", "https"),                                                                // 23
-        (":status", "103"),                                                                  // 24
-        (":status", "200"),                                                                  // 25
-        (":status", "304"),                                                                  // 26
-        (":status", "404"),                                                                  // 27
-        (":status", "503"),                                                                  // 28
-        ("accept", "*/*"),                                                                   // 29
-        ("accept", "application/dns-message"),                                               // 30
-        ("accept-encoding", "gzip, deflate, br"),                                            // 31
-        ("accept-ranges", "bytes"),                                                          // 32
-        ("access-control-allow-headers", "cache-control"),                                   // 33
-        ("access-control-allow-headers", "content-type"),                                    // 34
-        ("access-control-allow-origin", "*"),                                                // 35
-        ("cache-control", "max-age=0"),                                                      // 36
-        ("cache-control", "max-age=2592000"),                                                // 37
-        ("cache-control", "max-age=604800"),                                                 // 38
-        ("cache-control", "no-cache"),                                                       // 39
-        ("cache-control", "no-store"),                                                       // 40
-        ("cache-control", "public, max-age=31536000"),                                       // 41
-        ("content-encoding", "br"),                                                          // 42
-        ("content-encoding", "gzip"),                                                        // 43
-        ("content-type", "application/dns-message"),                                         // 44
-        ("content-type", "application/javascript"),                                          // 45
-        ("content-type", "application/json"),                                                // 46
-        ("content-type", "application/x-www-form-urlencoded"),                               // 47
-        ("content-type", "image/gif"),                                                       // 48
-        ("content-type", "image/jpeg"),                                                      // 49
-        ("content-type", "image/png"),                                                       // 50
-        ("content-type", "text/css"),                                                        // 51
-        ("content-type", "text/html; charset=utf-8"),                                        // 52
-        ("content-type", "text/plain"),                                                      // 53
-        ("content-type", "text/plain;charset=utf-8"),                                        // 54
-        ("range", "bytes=0-"),                                                               // 55
-        ("strict-transport-security", "max-age=31536000"),                                   // 56
-        ("strict-transport-security", "max-age=31536000; includesubdomains"),                // 57
-        ("strict-transport-security", "max-age=31536000; includesubdomains; preload"),       // 58
-        ("vary", "accept-encoding"),                                                         // 59
-        ("vary", "origin"),                                                                  // 60
-        ("x-content-type-options", "nosniff"),                                               // 61
-        ("x-xss-protection", "1; mode=block"),                                               // 62
-        (":status", "100"),                                                                  // 63
-        (":status", "204"),                                                                  // 64
-        (":status", "206"),                                                                  // 65
-        (":status", "302"),                                                                  // 66
-        (":status", "400"),                                                                  // 67
-        (":status", "403"),                                                                  // 68
-        (":status", "421"),                                                                  // 69
-        (":status", "425"),                                                                  // 70
-        (":status", "500"),                                                                  // 71
-        ("accept-language", ""),                                                             // 72
-        ("access-control-allow-credentials", "FALSE"),                                       // 73
-        ("access-control-allow-credentials", "TRUE"),                                        // 74
-        ("access-control-allow-headers", "*"),                                               // 75
-        ("access-control-allow-methods", "get"),                                             // 76
-        ("access-control-allow-methods", "get, post, options"),                              // 77
-        ("access-control-allow-methods", "options"),                                         // 78
-        ("access-control-expose-headers", "content-length"),                                 // 79
-        ("access-control-request-headers", "content-type"),                                  // 80
-        ("access-control-request-method", "get"),                                            // 81
-        ("access-control-request-method", "post"),                                           // 82
-        ("alt-svc", "clear"),                                                                // 83
-        ("authorization", ""),                                                               // 84
+        (":authority", ""),                                    // 0
+        (":path", "/"),                                        // 1
+        ("age", "0"),                                          // 2
+        ("content-disposition", ""),                           // 3
+        ("content-length", "0"),                               // 4
+        ("cookie", ""),                                        // 5
+        ("date", ""),                                          // 6
+        ("etag", ""),                                          // 7
+        ("if-modified-since", ""),                             // 8
+        ("if-none-match", ""),                                 // 9
+        ("last-modified", ""),                                 // 10
+        ("link", ""),                                          // 11
+        ("location", ""),                                      // 12
+        ("referer", ""),                                       // 13
+        ("set-cookie", ""),                                    // 14
+        (":method", "CONNECT"),                                // 15
+        (":method", "DELETE"),                                 // 16
+        (":method", "GET"),                                    // 17
+        (":method", "HEAD"),                                   // 18
+        (":method", "OPTIONS"),                                // 19
+        (":method", "POST"),                                   // 20
+        (":method", "PUT"),                                    // 21
+        (":scheme", "http"),                                   // 22
+        (":scheme", "https"),                                  // 23
+        (":status", "103"),                                    // 24
+        (":status", "200"),                                    // 25
+        (":status", "304"),                                    // 26
+        (":status", "404"),                                    // 27
+        (":status", "503"),                                    // 28
+        ("accept", "*/*"),                                     // 29
+        ("accept", "application/dns-message"),                 // 30
+        ("accept-encoding", "gzip, deflate, br"),              // 31
+        ("accept-ranges", "bytes"),                            // 32
+        ("access-control-allow-headers", "cache-control"),     // 33
+        ("access-control-allow-headers", "content-type"),      // 34
+        ("access-control-allow-origin", "*"),                  // 35
+        ("cache-control", "max-age=0"),                        // 36
+        ("cache-control", "max-age=2592000"),                  // 37
+        ("cache-control", "max-age=604800"),                   // 38
+        ("cache-control", "no-cache"),                         // 39
+        ("cache-control", "no-store"),                         // 40
+        ("cache-control", "public, max-age=31536000"),         // 41
+        ("content-encoding", "br"),                            // 42
+        ("content-encoding", "gzip"),                          // 43
+        ("content-type", "application/dns-message"),           // 44
+        ("content-type", "application/javascript"),            // 45
+        ("content-type", "application/json"),                  // 46
+        ("content-type", "application/x-www-form-urlencoded"), // 47
+        ("content-type", "image/gif"),                         // 48
+        ("content-type", "image/jpeg"),                        // 49
+        ("content-type", "image/png"),                         // 50
+        ("content-type", "text/css"),                          // 51
+        ("content-type", "text/html; charset=utf-8"),          // 52
+        ("content-type", "text/plain"),                        // 53
+        ("content-type", "text/plain;charset=utf-8"),          // 54
+        ("range", "bytes=0-"),                                 // 55
+        ("strict-transport-security", "max-age=31536000"),     // 56
+        (
+            "strict-transport-security",
+            "max-age=31536000; includesubdomains",
+        ), // 57
+        (
+            "strict-transport-security",
+            "max-age=31536000; includesubdomains; preload",
+        ), // 58
+        ("vary", "accept-encoding"),                           // 59
+        ("vary", "origin"),                                    // 60
+        ("x-content-type-options", "nosniff"),                 // 61
+        ("x-xss-protection", "1; mode=block"),                 // 62
+        (":status", "100"),                                    // 63
+        (":status", "204"),                                    // 64
+        (":status", "206"),                                    // 65
+        (":status", "302"),                                    // 66
+        (":status", "400"),                                    // 67
+        (":status", "403"),                                    // 68
+        (":status", "421"),                                    // 69
+        (":status", "425"),                                    // 70
+        (":status", "500"),                                    // 71
+        ("accept-language", ""),                               // 72
+        ("access-control-allow-credentials", "FALSE"),         // 73
+        ("access-control-allow-credentials", "TRUE"),          // 74
+        ("access-control-allow-headers", "*"),                 // 75
+        ("access-control-allow-methods", "get"),               // 76
+        ("access-control-allow-methods", "get, post, options"), // 77
+        ("access-control-allow-methods", "options"),           // 78
+        ("access-control-expose-headers", "content-length"),   // 79
+        ("access-control-request-headers", "content-type"),    // 80
+        ("access-control-request-method", "get"),              // 81
+        ("access-control-request-method", "post"),             // 82
+        ("alt-svc", "clear"),                                  // 83
+        ("authorization", ""),                                 // 84
         (
             "content-security-policy",
             "script-src 'none'; object-src 'none'; base-uri 'none'",
-        ),                                                                                   // 85
-        ("early-data", "1"),                                                                 // 86
-        ("expect-ct", ""),                                                                   // 87
-        ("forwarded", ""),                                                                   // 88
-        ("if-range", ""),                                                                    // 89
-        ("origin", ""),                                                                      // 90
-        ("purpose", "prefetch"),                                                             // 91
-        ("server", ""),                                                                      // 92
-        ("timing-allow-origin", "*"),                                                        // 93
-        ("upgrade-insecure-requests", "1"),                                                  // 94
-        ("user-agent", ""),                                                                  // 95
-        ("x-forwarded-for", ""),                                                             // 96
-        ("x-frame-options", "deny"),                                                         // 97
-        ("x-frame-options", "sameorigin"),                                                   // 98
+        ), // 85
+        ("early-data", "1"),                                   // 86
+        ("expect-ct", ""),                                     // 87
+        ("forwarded", ""),                                     // 88
+        ("if-range", ""),                                      // 89
+        ("origin", ""),                                        // 90
+        ("purpose", "prefetch"),                               // 91
+        ("server", ""),                                        // 92
+        ("timing-allow-origin", "*"),                          // 93
+        ("upgrade-insecure-requests", "1"),                    // 94
+        ("user-agent", ""),                                    // 95
+        ("x-forwarded-for", ""),                               // 96
+        ("x-frame-options", "deny"),                           // 97
+        ("x-frame-options", "sameorigin"),                     // 98
     ];
 
     /// Find an entry matching both `name` and `value` (case-sensitive on
@@ -339,7 +345,7 @@ pub(crate) mod qpack {
     /// from `prefix_high_bits` — typically the QPACK pattern byte
     /// (`0b11xxxxxx` for indexed-static, etc.).
     pub fn encode_int(value: u64, prefix_bits: u8, prefix_high_bits: u8, out: &mut Vec<u8>) {
-        debug_assert!(prefix_bits >= 1 && prefix_bits <= 8);
+        debug_assert!((1..=8).contains(&prefix_bits));
         let max_prefix = (1u64 << prefix_bits) - 1;
         if value < max_prefix {
             out.push(prefix_high_bits | (value as u8));
@@ -358,7 +364,7 @@ pub(crate) mod qpack {
     /// (already read by the caller so it can dispatch on the pattern bits).
     /// Returns `(value, extra_bytes_consumed_after_first)`.
     pub fn decode_int(first: u8, prefix_bits: u8, rest: &[u8]) -> Result<(u64, usize)> {
-        debug_assert!(prefix_bits >= 1 && prefix_bits <= 8);
+        debug_assert!((1..=8).contains(&prefix_bits));
         let mask = ((1u16 << prefix_bits) - 1) as u8;
         let prefix = (first & mask) as u64;
         let max_prefix = mask as u64;
@@ -461,7 +467,9 @@ pub(crate) mod qpack {
         }
         let mut p = 1 + n1;
         if p >= buf.len() {
-            return Err(Error::BadResponse("qpack: truncated field-section prefix".into()));
+            return Err(Error::BadResponse(
+                "qpack: truncated field-section prefix".into(),
+            ));
         }
         let (_base, n2) = decode_int(buf[p], 7, &buf[p + 1..])?;
         p += 1 + n2;
@@ -656,7 +664,11 @@ fn open_udp(req: &Request) -> Result<(UdpSocket, std::net::SocketAddr)> {
         .next()
         .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
     // Pick a local socket of the same family as the peer.
-    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let sock = UdpSocket::bind(bind)?;
     sock.connect(peer)?;
     // We do our own deadline accounting in the pump loop; set a short
@@ -697,8 +709,8 @@ fn pump_once(
                 got_anything = true;
             }
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => {}
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
             Err(e) => return Err(Error::Io(e)),
         }
     }
@@ -742,7 +754,9 @@ fn handshake(
         }
         pump_once(conn, sock, peer, true)?;
         if conn.is_closed() {
-            return Err(Error::BadResponse("http3: connection closed mid-handshake".into()));
+            return Err(Error::BadResponse(
+                "http3: connection closed mid-handshake".into(),
+            ));
         }
     }
     Ok(())
@@ -1090,8 +1104,8 @@ mod tests {
             (0u64, 8u8, 0x00u8),
             (1, 5, 0xE0),
             (10, 5, 0xE0),
-            (30, 5, 0xE0),       // 30 < 31 (max 5-bit prefix)
-            (31, 5, 0xE0),       // boundary: spills out
+            (30, 5, 0xE0), // 30 < 31 (max 5-bit prefix)
+            (31, 5, 0xE0), // boundary: spills out
             (1000, 5, 0xE0),
             (254, 8, 0x00),
             (255, 8, 0x00),
@@ -1099,8 +1113,7 @@ mod tests {
         ] {
             let mut buf = Vec::new();
             qpack::encode_int(value, prefix, pattern, &mut buf);
-            let (decoded, used) =
-                qpack::decode_int(buf[0], prefix, &buf[1..]).expect("decode_int");
+            let (decoded, used) = qpack::decode_int(buf[0], prefix, &buf[1..]).expect("decode_int");
             assert_eq!(decoded, value, "value {value}, prefix {prefix}");
             assert_eq!(used + 1, buf.len(), "used+1 == buf.len for value {value}");
         }

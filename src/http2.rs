@@ -78,8 +78,7 @@ fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
 fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
     let mut hdr = [0u8; 9];
     read_exact(r, &mut hdr)?;
-    let length =
-        ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | (hdr[2] as usize);
+    let length = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | (hdr[2] as usize);
     let typ = hdr[3];
     let flags = hdr[4];
     let stream_id = (((hdr[5] & 0x7f) as u32) << 24)
@@ -191,67 +190,67 @@ fn decode_int(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize)> {
 
 /// Indexed by `index - 1`. Each entry is (name, value).
 const STATIC_TABLE: &[(&str, &str)] = &[
-    (":authority", ""),                              // 1
-    (":method", "GET"),                              // 2
-    (":method", "POST"),                             // 3
-    (":path", "/"),                                  // 4
-    (":path", "/index.html"),                        // 5
-    (":scheme", "http"),                             // 6
-    (":scheme", "https"),                            // 7
-    (":status", "200"),                              // 8
-    (":status", "204"),                              // 9
-    (":status", "206"),                              // 10
-    (":status", "304"),                              // 11
-    (":status", "400"),                              // 12
-    (":status", "404"),                              // 13
-    (":status", "500"),                              // 14
-    ("accept-charset", ""),                          // 15
-    ("accept-encoding", "gzip, deflate"),            // 16
-    ("accept-language", ""),                         // 17
-    ("accept-ranges", ""),                           // 18
-    ("accept", ""),                                  // 19
-    ("access-control-allow-origin", ""),             // 20
-    ("age", ""),                                     // 21
-    ("allow", ""),                                   // 22
-    ("authorization", ""),                           // 23
-    ("cache-control", ""),                           // 24
-    ("content-disposition", ""),                     // 25
-    ("content-encoding", ""),                        // 26
-    ("content-language", ""),                        // 27
-    ("content-length", ""),                          // 28
-    ("content-location", ""),                        // 29
-    ("content-range", ""),                           // 30
-    ("content-type", ""),                            // 31
-    ("cookie", ""),                                  // 32
-    ("date", ""),                                    // 33
-    ("etag", ""),                                    // 34
-    ("expect", ""),                                  // 35
-    ("expires", ""),                                 // 36
-    ("from", ""),                                    // 37
-    ("host", ""),                                    // 38
-    ("if-match", ""),                                // 39
-    ("if-modified-since", ""),                       // 40
-    ("if-none-match", ""),                           // 41
-    ("if-range", ""),                                // 42
-    ("if-unmodified-since", ""),                     // 43
-    ("last-modified", ""),                           // 44
-    ("link", ""),                                    // 45
-    ("location", ""),                                // 46
-    ("max-forwards", ""),                            // 47
-    ("proxy-authenticate", ""),                      // 48
-    ("proxy-authorization", ""),                     // 49
-    ("range", ""),                                   // 50
-    ("referer", ""),                                 // 51
-    ("refresh", ""),                                 // 52
-    ("retry-after", ""),                             // 53
-    ("server", ""),                                  // 54
-    ("set-cookie", ""),                              // 55
-    ("strict-transport-security", ""),               // 56
-    ("transfer-encoding", ""),                       // 57
-    ("user-agent", ""),                              // 58
-    ("vary", ""),                                    // 59
-    ("via", ""),                                     // 60
-    ("www-authenticate", ""),                        // 61
+    (":authority", ""),                   // 1
+    (":method", "GET"),                   // 2
+    (":method", "POST"),                  // 3
+    (":path", "/"),                       // 4
+    (":path", "/index.html"),             // 5
+    (":scheme", "http"),                  // 6
+    (":scheme", "https"),                 // 7
+    (":status", "200"),                   // 8
+    (":status", "204"),                   // 9
+    (":status", "206"),                   // 10
+    (":status", "304"),                   // 11
+    (":status", "400"),                   // 12
+    (":status", "404"),                   // 13
+    (":status", "500"),                   // 14
+    ("accept-charset", ""),               // 15
+    ("accept-encoding", "gzip, deflate"), // 16
+    ("accept-language", ""),              // 17
+    ("accept-ranges", ""),                // 18
+    ("accept", ""),                       // 19
+    ("access-control-allow-origin", ""),  // 20
+    ("age", ""),                          // 21
+    ("allow", ""),                        // 22
+    ("authorization", ""),                // 23
+    ("cache-control", ""),                // 24
+    ("content-disposition", ""),          // 25
+    ("content-encoding", ""),             // 26
+    ("content-language", ""),             // 27
+    ("content-length", ""),               // 28
+    ("content-location", ""),             // 29
+    ("content-range", ""),                // 30
+    ("content-type", ""),                 // 31
+    ("cookie", ""),                       // 32
+    ("date", ""),                         // 33
+    ("etag", ""),                         // 34
+    ("expect", ""),                       // 35
+    ("expires", ""),                      // 36
+    ("from", ""),                         // 37
+    ("host", ""),                         // 38
+    ("if-match", ""),                     // 39
+    ("if-modified-since", ""),            // 40
+    ("if-none-match", ""),                // 41
+    ("if-range", ""),                     // 42
+    ("if-unmodified-since", ""),          // 43
+    ("last-modified", ""),                // 44
+    ("link", ""),                         // 45
+    ("location", ""),                     // 46
+    ("max-forwards", ""),                 // 47
+    ("proxy-authenticate", ""),           // 48
+    ("proxy-authorization", ""),          // 49
+    ("range", ""),                        // 50
+    ("referer", ""),                      // 51
+    ("refresh", ""),                      // 52
+    ("retry-after", ""),                  // 53
+    ("server", ""),                       // 54
+    ("set-cookie", ""),                   // 55
+    ("strict-transport-security", ""),    // 56
+    ("transfer-encoding", ""),            // 57
+    ("user-agent", ""),                   // 58
+    ("vary", ""),                         // 59
+    ("via", ""),                          // 60
+    ("www-authenticate", ""),             // 61
 ];
 
 /// 1-based index of a (name, value) pair, if present in the static table.
@@ -584,7 +583,9 @@ fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
     // Tail: remaining bits must be the most-significant bits of the EOS code
     // (all-ones), and there must be fewer than 8 of them (RFC 7541 §5.2).
     if acc_len >= 8 {
-        return Err(Error::BadResponse("hpack: trailing Huffman bits >= 8".into()));
+        return Err(Error::BadResponse(
+            "hpack: trailing Huffman bits >= 8".into(),
+        ));
     }
     if acc_len > 0 {
         let pad_mask = (1u64 << acc_len) - 1;
@@ -635,13 +636,9 @@ impl Decoder {
     }
 
     fn evict_to_fit(&mut self, incoming: usize) {
-        while self.dyn_table_size + incoming > self.dyn_table_cap
-            && !self.dyn_table.is_empty()
-        {
+        while self.dyn_table_size + incoming > self.dyn_table_cap && !self.dyn_table.is_empty() {
             let (n, v) = self.dyn_table.pop().unwrap();
-            self.dyn_table_size = self
-                .dyn_table_size
-                .saturating_sub(Self::entry_size(&n, &v));
+            self.dyn_table_size = self.dyn_table_size.saturating_sub(Self::entry_size(&n, &v));
         }
     }
 
@@ -810,7 +807,7 @@ fn tls_err(e: purecrypto::tls::Error) -> Error {
 }
 
 fn io_tls(e: purecrypto::tls::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("tls: {e:?}"))
+    io::Error::other(format!("tls: {e:?}"))
 }
 
 fn connect_tls_h2<S: Read + Write>(
@@ -1066,8 +1063,8 @@ pub fn send(req: Request) -> Result<Response> {
         }
 
         match frame.typ {
-            F_SETTINGS => {
-                if frame.flags & FLAG_ACK == 0 {
+            F_SETTINGS
+                if frame.flags & FLAG_ACK == 0 => {
                     // Server-sent SETTINGS, ack it.
                     let ack = Frame {
                         typ: F_SETTINGS,
@@ -1079,9 +1076,8 @@ pub fn send(req: Request) -> Result<Response> {
                     tls.flush()?;
                 }
                 // ACK from the server is silently absorbed.
-            }
-            F_PING => {
-                if frame.flags & FLAG_ACK == 0 {
+            F_PING
+                if frame.flags & FLAG_ACK == 0 => {
                     let pong = Frame {
                         typ: F_PING,
                         flags: FLAG_ACK,
@@ -1091,13 +1087,12 @@ pub fn send(req: Request) -> Result<Response> {
                     write_frame(&mut tls, &pong)?;
                     tls.flush()?;
                 }
-            }
             F_WINDOW_UPDATE => { /* flow control noise, ignore */ }
-            F_GOAWAY => {
+            F_GOAWAY
                 // Even mid-response, GOAWAY just means "no new streams"; if our
                 // stream has finished it can still be OK. If we haven't yet
                 // assembled headers, treat as failure.
-                if response_headers.is_none() {
+                if response_headers.is_none() => {
                     return Err(Error::BadResponse(format!(
                         "server sent GOAWAY (payload {} bytes)",
                         frame.payload.len()
@@ -1105,7 +1100,6 @@ pub fn send(req: Request) -> Result<Response> {
                 }
                 // Otherwise wait for END_STREAM as usual; if the server
                 // dropped us first we'll hit UnexpectedEof on the next read.
-            }
             F_RST_STREAM if frame.stream_id == 1 => {
                 let code = if frame.payload.len() >= 4 {
                     u32::from_be_bytes([
@@ -1127,7 +1121,9 @@ pub fn send(req: Request) -> Result<Response> {
                 let mut pad_len = 0usize;
                 if frame.flags & FLAG_PADDED != 0 {
                     if payload.is_empty() {
-                        return Err(Error::BadResponse("HEADERS PADDED with empty payload".into()));
+                        return Err(Error::BadResponse(
+                            "HEADERS PADDED with empty payload".into(),
+                        ));
                     }
                     pad_len = payload[0] as usize;
                     payload = &payload[1..];
@@ -1142,7 +1138,9 @@ pub fn send(req: Request) -> Result<Response> {
                     payload = &payload[5..];
                 }
                 if payload.len() < pad_len {
-                    return Err(Error::BadResponse("HEADERS padding overruns payload".into()));
+                    return Err(Error::BadResponse(
+                        "HEADERS padding overruns payload".into(),
+                    ));
                 }
                 let frag = &payload[..payload.len() - pad_len];
                 headers_buf.extend_from_slice(frag);
@@ -1284,12 +1282,7 @@ fn is_connection_specific_header(name: &str) -> bool {
     // RFC 9113 §8.2.2: connection-specific header fields MUST NOT be sent.
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "upgrade"
-            | "te" // unless value is exactly "trailers"; we conservatively drop.
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" // unless value is exactly "trailers"; we conservatively drop.
     )
 }
 
@@ -1322,7 +1315,15 @@ mod tests {
 
     #[test]
     fn int_decode_round_trips() {
-        for &(v, p) in &[(0u64, 5), (10, 5), (30, 5), (31, 5), (1337, 5), (1, 8), (255, 8)] {
+        for &(v, p) in &[
+            (0u64, 5),
+            (10, 5),
+            (30, 5),
+            (31, 5),
+            (1337, 5),
+            (1, 8),
+            (255, 8),
+        ] {
             let enc = encode_int(v, p);
             let (dec, n) = decode_int(&enc, p).unwrap();
             assert_eq!(dec, v, "value {v} with {p}-bit prefix");
@@ -1382,7 +1383,10 @@ mod tests {
             typ: F_HEADERS,
             flags: FLAG_END_STREAM | FLAG_END_HEADERS,
             stream_id: 1,
-            payload: vec![0x82, 0x86, 0x84, 0x41, 0x88, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff],
+            payload: vec![
+                0x82, 0x86, 0x84, 0x41, 0x88, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
+                0x90, 0xf4, 0xff,
+            ],
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &f).unwrap();
@@ -1395,7 +1399,7 @@ mod tests {
     #[test]
     fn frame_stream_id_high_bit_masked_on_read() {
         // Set the R bit (top bit of byte 5). RFC 9113 says receivers MUST ignore it.
-        let buf = vec![0, 0, 0, F_DATA, 0, 0x80 | 0, 0, 0, 1];
+        let buf = vec![0, 0, 0, F_DATA, 0, 0x80, 0, 0, 1];
         let mut cur = Cursor::new(buf);
         let f = read_frame(&mut cur).unwrap();
         assert_eq!(f.stream_id, 1);
@@ -1462,15 +1466,12 @@ mod tests {
         // RFC 7541 §C.2.1: encoding of "custom-key: custom-header" with
         // incremental indexing, literal name.
         let buf: Vec<u8> = vec![
-            0x40, 0x0a, b'c', b'u', b's', b't', b'o', b'm', b'-', b'k', b'e', b'y',
-            0x0d, b'c', b'u', b's', b't', b'o', b'm', b'-', b'h', b'e', b'a', b'd', b'e', b'r',
+            0x40, 0x0a, b'c', b'u', b's', b't', b'o', b'm', b'-', b'k', b'e', b'y', 0x0d, b'c',
+            b'u', b's', b't', b'o', b'm', b'-', b'h', b'e', b'a', b'd', b'e', b'r',
         ];
         let mut dec = Decoder::new();
         let got = dec.decode_block(&buf).unwrap();
-        assert_eq!(
-            got,
-            vec![("custom-key".into(), "custom-header".into())]
-        );
+        assert_eq!(got, vec![("custom-key".into(), "custom-header".into())]);
         // And the dynamic table should now hold the new entry.
         assert_eq!(dec.dyn_table.len(), 1);
     }
@@ -1525,7 +1526,8 @@ mod tests {
         // We computed the Huffman bytes elsewhere; just verify decoding works
         // on the vector printed in the RFC.
         let buf = vec![
-            0x44, 0x8c, 0x60, 0xd4, 0x85, 0x31, 0x68, 0xdf, 0x1c, 0x6f, 0xa2, 0xa6, 0xfd, 0x95, 0xb6, 0x88,
+            0x44, 0x8c, 0x60, 0xd4, 0x85, 0x31, 0x68, 0xdf, 0x1c, 0x6f, 0xa2, 0xa6, 0xfd, 0x95,
+            0xb6, 0x88,
         ];
         // This vector is hand-crafted to be illustrative; we accept either a
         // successful decode (preferred) or a clean error. The point of this
@@ -1539,7 +1541,10 @@ mod tests {
         let block = build_header_block(&req);
         let mut dec = Decoder::new();
         let headers = dec.decode_block(&block).unwrap();
-        let kv: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let kv: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert!(kv.contains(&(":method", "GET")));
         assert!(kv.contains(&(":scheme", "https")));
         assert!(kv.contains(&(":authority", "example.com")));

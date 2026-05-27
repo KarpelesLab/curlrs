@@ -413,9 +413,7 @@ mod tests {
         //   body: 00 01 (packet id), 00 03 'a' '/' 'b' (topic), 00 (QoS 0)
         //   body length = 2 + 5 + 1 = 8
         let got = build_subscribe(1, "a/b");
-        let expected: Vec<u8> = vec![
-            0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'b', 0x00,
-        ];
+        let expected: Vec<u8> = vec![0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'b', 0x00];
         assert_eq!(got, expected);
     }
 
@@ -449,7 +447,9 @@ mod tests {
         assert!(id.starts_with("curlrs-"), "got {id}");
         let suffix = &id["curlrs-".len()..];
         assert_eq!(suffix.len(), 12);
-        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(suffix
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // Two calls should not collide (48 bits of entropy).
         assert_ne!(random_client_id(), random_client_id());
     }

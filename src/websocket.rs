@@ -74,15 +74,18 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
     let key_bytes: [u8; 16] = random_16();
     let key_b64 = base64_encode(&key_bytes);
 
-    let host_header = if (url.scheme == "ws" && url.port == 80)
-        || (url.scheme == "wss" && url.port == 443)
-    {
-        url.host.clone()
-    } else {
-        format!("{}:{}", url.host, url.port)
-    };
+    let host_header =
+        if (url.scheme == "ws" && url.port == 80) || (url.scheme == "wss" && url.port == 443) {
+            url.host.clone()
+        } else {
+            format!("{}:{}", url.host, url.port)
+        };
 
-    let path = if url.path.is_empty() { "/" } else { url.path.as_str() };
+    let path = if url.path.is_empty() {
+        "/"
+    } else {
+        url.path.as_str()
+    };
 
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -144,7 +147,9 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
             }
         } else if k.eq_ignore_ascii_case("connection") {
             // Connection can be a comma-separated list of tokens.
-            if v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")) {
+            if v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+            {
                 connection_ok = true;
             }
         } else if k.eq_ignore_ascii_case("sec-websocket-accept") {
@@ -200,9 +205,7 @@ fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
                 ));
             }
             other => {
-                return Err(Error::BadResponse(format!(
-                    "unknown WS opcode 0x{other:x}"
-                )));
+                return Err(Error::BadResponse(format!("unknown WS opcode 0x{other:x}")));
             }
         }
     };
@@ -367,9 +370,8 @@ fn random_16() -> [u8; 16] {
 /// Standard base64 (RFC 4648 §4) with `=` padding. Hand-rolled so we don't
 /// pull in another dependency for ~30 lines of work.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
         let b0 = input[i];

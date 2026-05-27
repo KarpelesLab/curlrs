@@ -143,6 +143,12 @@ pub extern "C" fn curlrs_easy_reset(handle: *mut CURLRS) -> CurlrsCode {
 /// Set an option taking a NUL-terminated `const char*`.
 ///
 /// Pass NULL to clear/unset that option. The string is copied into the handle.
+///
+/// # Safety
+///
+/// `handle` must be a pointer returned by [`curlrs_easy_init`] and not yet
+/// freed by [`curlrs_easy_cleanup`]. `value`, if non-null, must point to a
+/// valid NUL-terminated C string for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn curlrs_easy_setopt_str(
     handle: *mut CURLRS,
@@ -196,11 +202,7 @@ pub extern "C" fn curlrs_easy_setopt_long(
     let Some(opt) = opt_from_int(option) else {
         return CurlrsCode::UnknownOption;
     };
-    let secs = if value <= 0 {
-        None
-    } else {
-        Some(value as u64)
-    };
+    let secs = if value <= 0 { None } else { Some(value as u64) };
     match opt {
         CurlrsOpt::ConnectTimeout => h.connect_timeout_secs = secs,
         CurlrsOpt::Timeout => h.timeout_secs = secs,
@@ -279,6 +281,12 @@ pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
 /// Borrow a pointer to the response body and its length. Pointer remains
 /// valid until the next perform/reset/cleanup. `out_ptr` is set to NULL and
 /// `out_len` to 0 if no response is available.
+///
+/// # Safety
+///
+/// `handle` must be a pointer returned by [`curlrs_easy_init`] and not yet
+/// freed by [`curlrs_easy_cleanup`]. `out_ptr` and `out_len` must be non-null
+/// and point to writable storage of the appropriate type.
 #[no_mangle]
 pub unsafe extern "C" fn curlrs_easy_response_body(
     handle: *const CURLRS,

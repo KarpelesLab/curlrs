@@ -73,18 +73,15 @@ fn main() -> ExitCode {
         return run_transfer(url, &args);
     }
 
-    let method = args
-        .method
-        .clone()
-        .unwrap_or_else(|| {
-            if args.head {
-                "HEAD".to_string()
-            } else if args.data.is_some() {
-                "POST".to_string()
-            } else {
-                "GET".to_string()
-            }
-        });
+    let method = args.method.clone().unwrap_or_else(|| {
+        if args.head {
+            "HEAD".to_string()
+        } else if args.data.is_some() {
+            "POST".to_string()
+        } else {
+            "GET".to_string()
+        }
+    });
 
     let mut req = match Request::new(&method, url) {
         Ok(r) => r,
@@ -198,10 +195,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-fn next_val(
-    it: &mut std::slice::Iter<'_, String>,
-    flag: &str,
-) -> Result<String, String> {
+fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {
     it.next()
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))

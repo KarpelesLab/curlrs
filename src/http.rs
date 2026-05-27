@@ -237,9 +237,9 @@ fn read_body<R: BufRead>(
         return Ok(Vec::new());
     }
 
-    let chunked = headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked"));
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+    });
     if chunked {
         return read_chunked(r);
     }

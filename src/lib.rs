@@ -9,9 +9,10 @@
 
 mod error;
 mod http;
-mod tls;
 mod transfer;
 mod url;
+
+pub mod tls;
 
 // Protocol backends — each one owns a single URL scheme family.
 pub mod dict;

@@ -62,8 +62,8 @@ impl Url {
             None => path,
         };
 
-        let default_port = default_port(&scheme)
-            .ok_or_else(|| Error::UnsupportedScheme(scheme.clone()))?;
+        let default_port =
+            default_port(&scheme).ok_or_else(|| Error::UnsupportedScheme(scheme.clone()))?;
 
         let (userinfo, hostport) = match authority.rfind('@') {
             Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
@@ -181,8 +181,8 @@ mod tests {
     #[test]
     fn default_ports_cover_all_protocols() {
         for scheme in [
-            "http", "https", "ftp", "ftps", "dict", "gopher", "gophers", "imap", "imaps",
-            "ldap", "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "tftp", "ws", "wss",
+            "http", "https", "ftp", "ftps", "dict", "gopher", "gophers", "imap", "imaps", "ldap",
+            "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "tftp", "ws", "wss",
         ] {
             let url = format!("{scheme}://example.com");
             let u = Url::parse(&url).unwrap_or_else(|e| panic!("scheme {scheme}: {e}"));
@@ -192,11 +192,15 @@ mod tests {
 
     #[test]
     fn is_tls_classification() {
-        for s in ["https", "ftps", "imaps", "pop3s", "ldaps", "gophers", "mqtts", "wss"] {
+        for s in [
+            "https", "ftps", "imaps", "pop3s", "ldaps", "gophers", "mqtts", "wss",
+        ] {
             let u = Url::parse(&format!("{s}://h")).unwrap();
             assert!(u.is_tls(), "{s} should be tls");
         }
-        for s in ["http", "ftp", "imap", "pop3", "ldap", "gopher", "mqtt", "ws", "dict", "tftp", "rtsp"] {
+        for s in [
+            "http", "ftp", "imap", "pop3", "ldap", "gopher", "mqtt", "ws", "dict", "tftp", "rtsp",
+        ] {
             let u = Url::parse(&format!("{s}://h")).unwrap();
             assert!(!u.is_tls(), "{s} should not be tls");
         }

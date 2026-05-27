@@ -90,11 +90,7 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
         let b = body[i];
         out.push(b);
         i += 1;
-        if b == b'\n' {
-            at_line_start = true;
-        } else {
-            at_line_start = false;
-        }
+        at_line_start = b == b'\n';
     }
     out
 }
@@ -163,8 +159,7 @@ impl<R: Read + Write> Session<R> {
         while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
             buf.pop();
         }
-        String::from_utf8(buf)
-            .map_err(|_| Error::BadResponse("pop3: non-UTF8 status line".into()))
+        String::from_utf8(buf).map_err(|_| Error::BadResponse("pop3: non-UTF8 status line".into()))
     }
 
     /// Read a status line and require it to start with `+OK`. Returns the

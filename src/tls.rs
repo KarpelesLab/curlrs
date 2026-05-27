@@ -72,8 +72,8 @@ fn pem_blocks(pem: &str) -> Vec<String> {
 }
 
 /// A blocking TLS adapter around a transport `S: Read + Write` plus a
-/// purecrypto `Connection`. The handshake runs in [`TlsStream::connect`];
-/// after that, `Read`/`Write` work like an ordinary stream.
+/// purecrypto `Connection`. The handshake runs in [`connect_over`]; after
+/// that, `Read`/`Write` work like an ordinary stream.
 pub struct TlsStream<S: Read + Write> {
     conn: Connection,
     sock: S,
@@ -228,7 +228,7 @@ fn tls_err(e: purecrypto::tls::Error) -> Error {
 }
 
 fn io_tls(e: purecrypto::tls::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("tls: {e:?}"))
+    io::Error::other(format!("tls: {e:?}"))
 }
 
 #[cfg(test)]

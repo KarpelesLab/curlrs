@@ -99,7 +99,10 @@ fn parse_error(buf: &[u8]) -> Result<String> {
     }
     // bytes [2..4] are the error code, then a NUL-terminated message.
     let msg_bytes = &buf[4..];
-    let end = msg_bytes.iter().position(|&b| b == 0).unwrap_or(msg_bytes.len());
+    let end = msg_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(msg_bytes.len());
     Ok(String::from_utf8_lossy(&msg_bytes[..end]).into_owned())
 }
 
@@ -245,9 +248,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
                 return Err(Error::BadResponse(format!("tftp: {msg}")));
             }
             Some(op) => {
-                return Err(Error::BadResponse(format!(
-                    "tftp: unexpected opcode {op}"
-                )));
+                return Err(Error::BadResponse(format!("tftp: unexpected opcode {op}")));
             }
             None => {
                 return Err(Error::BadResponse("tftp: packet too short".into()));
@@ -278,7 +279,10 @@ mod tests {
         // We don't reject here (`fetch` does), but the encoding should still
         // be well-formed: two NULs around an empty mode string.
         let p = build_rrq("");
-        assert_eq!(p, vec![0x00, 0x01, 0x00, b'o', b'c', b't', b'e', b't', 0x00]);
+        assert_eq!(
+            p,
+            vec![0x00, 0x01, 0x00, b'o', b'c', b't', b'e', b't', 0x00]
+        );
     }
 
     #[test]

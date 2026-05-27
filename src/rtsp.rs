@@ -102,8 +102,7 @@ fn read_response_body<R: Read>(reader: BufReader<R>) -> Result<Vec<u8>> {
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
-    let (_version, status, reason) =
-        parse_status_line(status_line.trim_end_matches(['\r', '\n']))?;
+    let (_version, status, reason) = parse_status_line(status_line.trim_end_matches(['\r', '\n']))?;
     if !(200..300).contains(&status) {
         return Err(Error::BadResponse(format!("rtsp: {status} {reason}")));
     }
@@ -176,10 +175,7 @@ mod tests {
     #[test]
     fn request_uri_strips_userinfo() {
         let u = url("rtsp://alice:secret@cam.local/axis-media/media.amp");
-        assert_eq!(
-            request_uri(&u),
-            "rtsp://cam.local/axis-media/media.amp"
-        );
+        assert_eq!(request_uri(&u), "rtsp://cam.local/axis-media/media.amp");
     }
 
     #[test]

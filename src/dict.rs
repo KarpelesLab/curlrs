@@ -41,10 +41,7 @@ impl DictRequest {
     fn to_command(&self) -> String {
         match self.verb {
             Verb::Define => format!("DEFINE {} {}", self.database, self.word),
-            Verb::Match => format!(
-                "MATCH {} {} {}",
-                self.database, self.strategy, self.word
-            ),
+            Verb::Match => format!("MATCH {} {} {}", self.database, self.strategy, self.word),
             Verb::ShowDatabases => "SHOW DATABASES".to_string(),
         }
     }
@@ -156,7 +153,11 @@ fn read_text_block<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> Result<()> 
         // Skip the leading-dot only when it was followed by another character
         // (so that text lines starting with a literal dot survive); a bare "."
         // was handled above.
-        let to_write = if body.starts_with('.') { unescaped } else { body };
+        let to_write = if body.starts_with('.') {
+            unescaped
+        } else {
+            body
+        };
         out.extend_from_slice(to_write.as_bytes());
         out.extend_from_slice(b"\n");
     }
@@ -207,11 +208,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
 /// Read the response for a single command (the request `verb` determines how
 /// many text blocks to expect).
-fn read_response<R: BufRead>(
-    reader: &mut R,
-    verb: &Verb,
-    out: &mut Vec<u8>,
-) -> Result<()> {
+fn read_response<R: BufRead>(reader: &mut R, verb: &Verb, out: &mut Vec<u8>) -> Result<()> {
     let mut status = read_line(reader)?;
     loop {
         let (code, msg) = parse_status(&status)?;
