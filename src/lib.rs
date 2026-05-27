@@ -8,6 +8,7 @@
 
 mod error;
 mod http;
+mod tls;
 mod url;
 
 pub mod ffi;

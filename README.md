@@ -17,9 +17,13 @@ Early, in active development.
 |---|---|
 | HTTP/1.1 GET | working |
 | HTTP/1.1 other methods | working (basic) |
-| HTTPS via purecrypto | planned |
+| HTTPS via purecrypto | working (TLS 1.2/1.3, system roots, cert verification) |
 | FTP / FTPS | planned |
 | HTTP/2, HTTP/3 | not yet |
+
+System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
+`/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem`,
+`/etc/ca-certificates/extracted/tls-ca-bundle.pem`.
 
 ## Rust usage
 

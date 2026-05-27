@@ -52,10 +52,8 @@ impl Request {
 
     pub fn send(self) -> Result<Response> {
         match self.url.scheme.as_str() {
-            "http" => send_http(self),
-            "https" => Err(Error::UnsupportedScheme(
-                "https (TLS via purecrypto not wired in yet)".into(),
-            )),
+            "http" => send_plain(self),
+            "https" => send_https(self),
             other => Err(Error::UnsupportedScheme(other.to_string())),
         }
     }
@@ -81,7 +79,20 @@ impl Response {
     }
 }
 
-fn send_http(req: Request) -> Result<Response> {
+fn send_plain(req: Request) -> Result<Response> {
+    let stream = tcp_connect(&req)?;
+    write_request(&stream, &req)?;
+    read_response(stream, &req.method)
+}
+
+fn send_https(req: Request) -> Result<Response> {
+    let tcp = tcp_connect(&req)?;
+    let mut tls = crate::tls::connect_over(tcp, &req.url.host)?;
+    write_request(&mut tls, &req)?;
+    read_response(tls, &req.method)
+}
+
+fn tcp_connect(req: &Request) -> Result<TcpStream> {
     let addr = format!("{}:{}", req.url.host, req.url.port);
     let stream = match req.connect_timeout {
         Some(t) => {
@@ -96,9 +107,7 @@ fn send_http(req: Request) -> Result<Response> {
     };
     stream.set_read_timeout(req.read_timeout)?;
     stream.set_write_timeout(req.read_timeout)?;
-
-    write_request(&stream, &req)?;
-    read_response(stream, &req.method)
+    Ok(stream)
 }
 
 fn write_request<W: Write>(mut w: W, req: &Request) -> Result<()> {
