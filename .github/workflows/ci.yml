@@ -41,7 +41,7 @@ jobs:
 
       - name: Test (all features, release)
         # `--release` so the integration tests in tests/ (which spin up a
-        # local HTTP/1.1 server and round-trip real bytes through curlrs)
+        # local HTTP/1.1 server and round-trip real bytes through rsurl)
         # exercise the same code paths CI ships. The unit tests are cheap
         # enough that running them in release adds no meaningful time.
         run: cargo test --release --all-features
@@ -65,17 +65,17 @@ jobs:
 
       - name: Compile and run the C smoke test (static link)
         run: |
-          cc tests/ffi_smoke.c -I include target/release/libcurlrs.a \
+          cc tests/ffi_smoke.c -I include target/release/librsurl.a \
              -lpthread -ldl -lm -o ffi_smoke_static
           ./ffi_smoke_static
 
       - name: Compile and run the C smoke test (shared link)
         # Same source, linked against the cdylib instead of the staticlib.
         # LD_LIBRARY_PATH points the loader at target/release so the
-        # binary can find libcurlrs.so at run time without installing it.
+        # binary can find librsurl.so at run time without installing it.
         run: |
           cc tests/ffi_smoke.c -I include \
-             -L target/release -lcurlrs \
+             -L target/release -lrsurl \
              -o ffi_smoke_shared
           LD_LIBRARY_PATH=target/release ./ffi_smoke_shared
 

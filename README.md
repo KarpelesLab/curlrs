@@ -1,13 +1,13 @@
-# curlrs
+# rsurl
 
 A pure-Rust implementation of curl, built on top of [purecrypto](https://crates.io/crates/purecrypto)
 for TLS — no OpenSSL, no system libcurl, no C dependencies.
 
-`curlrs` ships in three forms:
+`rsurl` ships in three forms:
 
-1. **Rust library** (`curlrs` crate) — a small, ergonomic HTTP client API for Rust projects.
-2. **C library** (`libcurlrs.so` / `curlrs.h`) — a curl-compatible C ABI for non-Rust consumers.
-3. **`curlrs` CLI** — a drop-in-ish replacement for the `curl` command line.
+1. **Rust library** (`rsurl` crate) — a small, ergonomic HTTP client API for Rust projects.
+2. **C library** (`librsurl.so` / `rsurl.h`) — a curl-compatible C ABI for non-Rust consumers.
+3. **`rsurl` CLI** — a drop-in-ish replacement for the `curl` command line.
 
 ## Status
 
@@ -41,7 +41,7 @@ System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
 ## Rust usage
 
 ```rust
-let resp = curlrs::get("http://example.com")?;
+let resp = rsurl::get("http://example.com")?;
 println!("{} {}", resp.status, resp.reason);
 println!("{}", String::from_utf8_lossy(&resp.body));
 ```
@@ -49,18 +49,18 @@ println!("{}", String::from_utf8_lossy(&resp.body));
 ## CLI usage
 
 ```sh
-curlrs http://example.com
-curlrs -o out.html -v http://example.com
-curlrs https://example.com               # HTTPS via purecrypto
-curlrs -L http://github.com              # follow redirects
-curlrs -u alice:hunter2 http://api/...   # HTTP Basic auth
-curlrs -k https://expired.badssl.com     # skip TLS verification (insecure!)
-curlrs --cacert ./roots.pem https://...  # custom trust anchors
-curlrs --max-time 5 -O http://e/foo.bin  # cap total time, save as foo.bin
-curlrs file:///etc/hostname              # local file
-curlrs dict://dict.org/d:curl            # dictionary lookup
-curlrs gopher://gopher.floodgap.com/     # gopher menu
-curlrs ftp://ftp.example.com/pub/file    # FTP download
+rsurl http://example.com
+rsurl -o out.html -v http://example.com
+rsurl https://example.com               # HTTPS via purecrypto
+rsurl -L http://github.com              # follow redirects
+rsurl -u alice:hunter2 http://api/...   # HTTP Basic auth
+rsurl -k https://expired.badssl.com     # skip TLS verification (insecure!)
+rsurl --cacert ./roots.pem https://...  # custom trust anchors
+rsurl --max-time 5 -O http://e/foo.bin  # cap total time, save as foo.bin
+rsurl file:///etc/hostname              # local file
+rsurl dict://dict.org/d:curl            # dictionary lookup
+rsurl gopher://gopher.floodgap.com/     # gopher menu
+rsurl ftp://ftp.example.com/pub/file    # FTP download
 ```
 
 Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
@@ -71,30 +71,30 @@ command line are processed sequentially.
 ## C usage
 
 ```c
-#include "curlrs.h"
+#include "rsurl.h"
 
-CURLRS *h = curlrs_easy_init();
-curlrs_easy_setopt_str(h, CURLRSOPT_URL, "http://example.com");
-curlrs_easy_perform(h);
+RSURL *h = rsurl_easy_init();
+rsurl_easy_setopt_str(h, RSURLOPT_URL, "http://example.com");
+rsurl_easy_perform(h);
 
 const uint8_t *body; size_t len;
-curlrs_easy_response_body(h, &body, &len);
-printf("%ld %.*s\n", curlrs_easy_response_status(h), (int)len, body);
+rsurl_easy_response_body(h, &body, &len);
+printf("%ld %.*s\n", rsurl_easy_response_status(h), (int)len, body);
 
-curlrs_easy_cleanup(h);
+rsurl_easy_cleanup(h);
 ```
 
-Link with `-lcurlrs`. Function names use a `curlrs_` prefix so the library
+Link with `-lrsurl`. Function names use a `rsurl_` prefix so the library
 can coexist with libcurl in the same process.
 
 ## Build
 
 ```sh
 cargo build --release
-# Binary:       target/release/curlrs
-# Rust rlib:    target/release/libcurlrs.rlib
-# C cdylib:     target/release/libcurlrs.so
-# C header:     include/curlrs.h
+# Binary:       target/release/rsurl
+# Rust rlib:    target/release/librsurl.rlib
+# C cdylib:     target/release/librsurl.so
+# C header:     include/rsurl.h
 ```
 
 ## License

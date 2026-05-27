@@ -1126,7 +1126,7 @@ fn build_header_block(req: &Request) -> Vec<u8> {
         hpack_encode_header(
             &mut out,
             "user-agent",
-            concat!("curlrs/", env!("CARGO_PKG_VERSION")),
+            concat!("rsurl/", env!("CARGO_PKG_VERSION")),
         );
     }
     if !have_accept {

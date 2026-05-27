@@ -167,7 +167,7 @@ pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
     Url::parse(&composed)
 }
 
-/// Default port for every scheme curlrs knows about. Returning `None` means
+/// Default port for every scheme rsurl knows about. Returning `None` means
 /// the scheme is not recognized at all (URL parsing will reject it).
 fn default_port(scheme: &str) -> Option<u16> {
     Some(match scheme {

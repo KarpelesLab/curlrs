@@ -80,7 +80,7 @@ jobs:
           # a no-op for the native targets.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --bin curlrs --target ${{ matrix.target }}
+          cargo build --release --bin rsurl --target ${{ matrix.target }}
           cargo rustc --lib --release --crate-type staticlib --target ${{ matrix.target }}
           cargo rustc --lib --release --crate-type cdylib --target ${{ matrix.target }}
 
@@ -88,19 +88,19 @@ jobs:
         shell: bash
         run: |
           mkdir -p staging/bin staging/lib staging/include
-          cp include/curlrs.h staging/include/
+          cp include/rsurl.h staging/include/
           cp README.md LICENSE staging/
           td="target/${{ matrix.target }}/release"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "$td/curlrs.exe" staging/bin/
-            cp "$td/curlrs.lib" staging/lib/ 2>/dev/null || true      # static library
-            cp "$td/curlrs.dll" staging/lib/ 2>/dev/null || true      # shared library
-            cp "$td/curlrs.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
+            cp "$td/rsurl.exe" staging/bin/
+            cp "$td/rsurl.lib" staging/lib/ 2>/dev/null || true      # static library
+            cp "$td/rsurl.dll" staging/lib/ 2>/dev/null || true      # shared library
+            cp "$td/rsurl.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
           else
-            cp "$td/curlrs" staging/bin/
-            cp "$td/libcurlrs.a" staging/lib/
-            cp "$td"/libcurlrs.so staging/lib/ 2>/dev/null || true    # Linux
-            cp "$td"/libcurlrs.dylib staging/lib/ 2>/dev/null || true # macOS
+            cp "$td/rsurl" staging/bin/
+            cp "$td/librsurl.a" staging/lib/
+            cp "$td"/librsurl.so staging/lib/ 2>/dev/null || true    # Linux
+            cp "$td"/librsurl.dylib staging/lib/ 2>/dev/null || true # macOS
           fi
           ls -R staging
 
@@ -108,7 +108,7 @@ jobs:
         id: pack
         shell: bash
         run: |
-          name="curlrs-${TAG}-${{ matrix.asset_suffix }}"
+          name="rsurl-${TAG}-${{ matrix.asset_suffix }}"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             asset="${name}.zip"
             (cd staging && 7z a "../${asset}" *)
@@ -142,7 +142,7 @@ jobs:
       - name: Build both Apple slices (CLI + C library)
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --bin curlrs --target "$t"
+            cargo build --release --bin rsurl --target "$t"
             cargo rustc --lib --release --crate-type staticlib --target "$t"
             cargo rustc --lib --release --crate-type cdylib --target "$t"
           done
@@ -150,23 +150,23 @@ jobs:
       - name: Lipo into universal artifacts
         run: |
           mkdir -p staging/bin staging/lib staging/include
-          lipo -create -output staging/bin/curlrs \
-            target/x86_64-apple-darwin/release/curlrs \
-            target/aarch64-apple-darwin/release/curlrs
-          lipo -create -output staging/lib/libcurlrs.a \
-            target/x86_64-apple-darwin/release/libcurlrs.a \
-            target/aarch64-apple-darwin/release/libcurlrs.a
-          lipo -create -output staging/lib/libcurlrs.dylib \
-            target/x86_64-apple-darwin/release/libcurlrs.dylib \
-            target/aarch64-apple-darwin/release/libcurlrs.dylib
-          cp include/curlrs.h staging/include/
+          lipo -create -output staging/bin/rsurl \
+            target/x86_64-apple-darwin/release/rsurl \
+            target/aarch64-apple-darwin/release/rsurl
+          lipo -create -output staging/lib/librsurl.a \
+            target/x86_64-apple-darwin/release/librsurl.a \
+            target/aarch64-apple-darwin/release/librsurl.a
+          lipo -create -output staging/lib/librsurl.dylib \
+            target/x86_64-apple-darwin/release/librsurl.dylib \
+            target/aarch64-apple-darwin/release/librsurl.dylib
+          cp include/rsurl.h staging/include/
           cp README.md LICENSE staging/
-          file staging/bin/curlrs staging/lib/libcurlrs.*
+          file staging/bin/rsurl staging/lib/librsurl.*
 
       - name: Pack archive
         id: pack
         run: |
-          asset="curlrs-${TAG}-macos-universal.tar.gz"
+          asset="rsurl-${TAG}-macos-universal.tar.gz"
           tar -C staging -czf "${asset}" .
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 

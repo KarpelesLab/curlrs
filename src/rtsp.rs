@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::url::Url;
 
-const DEFAULT_USER_AGENT: &str = concat!("curlrs/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_PORT: u16 = 554;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -191,7 +191,7 @@ mod tests {
         assert!(req.starts_with("DESCRIBE rtsp://example.com/foo RTSP/1.0\r\n"));
         assert!(req.contains("\r\nCSeq: 1\r\n"));
         assert!(req.contains("\r\nAccept: application/sdp\r\n"));
-        assert!(req.contains("\r\nUser-Agent: curlrs/"));
+        assert!(req.contains("\r\nUser-Agent: rsurl/"));
         assert!(req.ends_with("\r\n\r\n"));
     }
 

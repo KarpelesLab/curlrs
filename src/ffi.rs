@@ -1,24 +1,24 @@
-//! C ABI for curlrs.
+//! C ABI for rsurl.
 //!
 //! A deliberately minimal, libcurl-shaped "easy" API. Function names use a
-//! `curlrs_` prefix (not `curl_`) so this can be linked alongside libcurl
+//! `rsurl_` prefix (not `curl_`) so this can be linked alongside libcurl
 //! without symbol clashes, while still being familiar to anyone who has
 //! used libcurl before.
 //!
 //! Lifecycle:
 //!
 //! ```c
-//! CURLRS *h = curlrs_easy_init();
-//! curlrs_easy_setopt(h, CURLRSOPT_URL, "http://example.com");
-//! curlrs_easy_perform(h);
+//! RSURL *h = rsurl_easy_init();
+//! rsurl_easy_setopt(h, RSURLOPT_URL, "http://example.com");
+//! rsurl_easy_perform(h);
 //! const uint8_t *body; size_t len;
-//! curlrs_easy_response_body(h, &body, &len);
-//! curlrs_easy_cleanup(h);
+//! rsurl_easy_response_body(h, &body, &len);
+//! rsurl_easy_cleanup(h);
 //! ```
 //!
 //! All pointer parameters except `handle` may be NULL where stated. Returned
-//! pointers from `curlrs_easy_response_*` borrow from the handle and become
-//! invalid on the next `curlrs_easy_perform` or `curlrs_easy_cleanup`.
+//! pointers from `rsurl_easy_response_*` borrow from the handle and become
+//! invalid on the next `rsurl_easy_perform` or `rsurl_easy_cleanup`.
 
 #![allow(non_camel_case_types)]
 
@@ -28,11 +28,11 @@ use std::ptr;
 use crate::http::{Request, Response};
 
 /// Opaque handle. Never dereferenced from C.
-pub enum CURLRS {}
+pub enum RSURL {}
 
-/// Option codes accepted by `curlrs_easy_setopt`.
+/// Option codes accepted by `rsurl_easy_setopt`.
 #[repr(C)]
-pub enum CurlrsOpt {
+pub enum RsurlOpt {
     /// const char* — the target URL.
     Url = 1,
     /// const char* — override HTTP method (default GET, or POST if body set).
@@ -52,7 +52,7 @@ pub enum CurlrsOpt {
 /// Status codes returned by the API.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CurlrsCode {
+pub enum RsurlCode {
     Ok = 0,
     InvalidHandle = 1,
     UnknownOption = 2,
@@ -93,7 +93,7 @@ impl Handle {
     }
 }
 
-fn handle_mut<'a>(h: *mut CURLRS) -> Option<&'a mut Handle> {
+fn handle_mut<'a>(h: *mut RSURL) -> Option<&'a mut Handle> {
     if h.is_null() {
         return None;
     }
@@ -101,7 +101,7 @@ fn handle_mut<'a>(h: *mut CURLRS) -> Option<&'a mut Handle> {
     Some(unsafe { &mut *(h as *mut Handle) })
 }
 
-fn handle_ref<'a>(h: *const CURLRS) -> Option<&'a Handle> {
+fn handle_ref<'a>(h: *const RSURL) -> Option<&'a Handle> {
     if h.is_null() {
         return None;
     }
@@ -110,20 +110,20 @@ fn handle_ref<'a>(h: *const CURLRS) -> Option<&'a Handle> {
 }
 
 /// Allocate a new easy handle. Returns NULL on allocation failure (practically
-/// never on this platform). Free with `curlrs_easy_cleanup`.
+/// never on this platform). Free with `rsurl_easy_cleanup`.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_init() -> *mut CURLRS {
+pub extern "C" fn rsurl_easy_init() -> *mut RSURL {
     let boxed = Box::new(Handle::new());
-    Box::into_raw(boxed) as *mut CURLRS
+    Box::into_raw(boxed) as *mut RSURL
 }
 
 /// Free an easy handle. NULL is a no-op.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_cleanup(handle: *mut CURLRS) {
+pub extern "C" fn rsurl_easy_cleanup(handle: *mut RSURL) {
     if handle.is_null() {
         return;
     }
-    // SAFETY: handle came from curlrs_easy_init's Box::into_raw.
+    // SAFETY: handle came from rsurl_easy_init's Box::into_raw.
     unsafe {
         drop(Box::from_raw(handle as *mut Handle));
     }
@@ -132,12 +132,12 @@ pub extern "C" fn curlrs_easy_cleanup(handle: *mut CURLRS) {
 /// Reset all options on a handle but keep it allocated. Clears any previous
 /// response data.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_reset(handle: *mut CURLRS) -> CurlrsCode {
+pub extern "C" fn rsurl_easy_reset(handle: *mut RSURL) -> RsurlCode {
     let Some(h) = handle_mut(handle) else {
-        return CurlrsCode::InvalidHandle;
+        return RsurlCode::InvalidHandle;
     };
     *h = Handle::new();
-    CurlrsCode::Ok
+    RsurlCode::Ok
 }
 
 /// Set an option taking a NUL-terminated `const char*`.
@@ -146,17 +146,17 @@ pub extern "C" fn curlrs_easy_reset(handle: *mut CURLRS) -> CurlrsCode {
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer returned by [`curlrs_easy_init`] and not yet
-/// freed by [`curlrs_easy_cleanup`]. `value`, if non-null, must point to a
+/// `handle` must be a pointer returned by [`rsurl_easy_init`] and not yet
+/// freed by [`rsurl_easy_cleanup`]. `value`, if non-null, must point to a
 /// valid NUL-terminated C string for the duration of this call.
 #[no_mangle]
-pub unsafe extern "C" fn curlrs_easy_setopt_str(
-    handle: *mut CURLRS,
+pub unsafe extern "C" fn rsurl_easy_setopt_str(
+    handle: *mut RSURL,
     option: c_int,
     value: *const c_char,
-) -> CurlrsCode {
+) -> RsurlCode {
     let Some(h) = handle_mut(handle) else {
-        return CurlrsCode::InvalidHandle;
+        return RsurlCode::InvalidHandle;
     };
     let s = if value.is_null() {
         None
@@ -164,62 +164,62 @@ pub unsafe extern "C" fn curlrs_easy_setopt_str(
         // SAFETY: caller asserts value is a valid NUL-terminated C string.
         match unsafe { CStr::from_ptr(value) }.to_str() {
             Ok(s) => Some(s.to_string()),
-            Err(_) => return CurlrsCode::InvalidArg,
+            Err(_) => return RsurlCode::InvalidArg,
         }
     };
     let Some(opt) = opt_from_int(option) else {
-        return CurlrsCode::UnknownOption;
+        return RsurlCode::UnknownOption;
     };
     match opt {
-        CurlrsOpt::Url => h.url = s,
-        CurlrsOpt::CustomRequest => h.method = s,
-        CurlrsOpt::UserAgent => h.user_agent = s,
-        CurlrsOpt::Header => match s {
+        RsurlOpt::Url => h.url = s,
+        RsurlOpt::CustomRequest => h.method = s,
+        RsurlOpt::UserAgent => h.user_agent = s,
+        RsurlOpt::Header => match s {
             Some(line) => {
                 let Some((k, v)) = line.split_once(':') else {
-                    return CurlrsCode::InvalidArg;
+                    return RsurlCode::InvalidArg;
                 };
                 h.headers.push((k.trim().to_string(), v.trim().to_string()));
             }
             None => h.headers.clear(),
         },
-        CurlrsOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
-        CurlrsOpt::ConnectTimeout | CurlrsOpt::Timeout => return CurlrsCode::InvalidArg,
+        RsurlOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
+        RsurlOpt::ConnectTimeout | RsurlOpt::Timeout => return RsurlCode::InvalidArg,
     }
-    CurlrsCode::Ok
+    RsurlCode::Ok
 }
 
 /// Set an option taking a `long` (e.g. timeouts).
 #[no_mangle]
-pub extern "C" fn curlrs_easy_setopt_long(
-    handle: *mut CURLRS,
+pub extern "C" fn rsurl_easy_setopt_long(
+    handle: *mut RSURL,
     option: c_int,
     value: c_long,
-) -> CurlrsCode {
+) -> RsurlCode {
     let Some(h) = handle_mut(handle) else {
-        return CurlrsCode::InvalidHandle;
+        return RsurlCode::InvalidHandle;
     };
     let Some(opt) = opt_from_int(option) else {
-        return CurlrsCode::UnknownOption;
+        return RsurlCode::UnknownOption;
     };
     let secs = if value <= 0 { None } else { Some(value as u64) };
     match opt {
-        CurlrsOpt::ConnectTimeout => h.connect_timeout_secs = secs,
-        CurlrsOpt::Timeout => h.timeout_secs = secs,
-        _ => return CurlrsCode::InvalidArg,
+        RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
+        RsurlOpt::Timeout => h.timeout_secs = secs,
+        _ => return RsurlCode::InvalidArg,
     }
-    CurlrsCode::Ok
+    RsurlCode::Ok
 }
 
-fn opt_from_int(v: c_int) -> Option<CurlrsOpt> {
+fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
     Some(match v {
-        1 => CurlrsOpt::Url,
-        2 => CurlrsOpt::CustomRequest,
-        3 => CurlrsOpt::Header,
-        4 => CurlrsOpt::PostFieldsString,
-        5 => CurlrsOpt::ConnectTimeout,
-        6 => CurlrsOpt::Timeout,
-        7 => CurlrsOpt::UserAgent,
+        1 => RsurlOpt::Url,
+        2 => RsurlOpt::CustomRequest,
+        3 => RsurlOpt::Header,
+        4 => RsurlOpt::PostFieldsString,
+        5 => RsurlOpt::ConnectTimeout,
+        6 => RsurlOpt::Timeout,
+        7 => RsurlOpt::UserAgent,
         _ => return None,
     })
 }
@@ -227,12 +227,12 @@ fn opt_from_int(v: c_int) -> Option<CurlrsOpt> {
 /// Execute the request configured on the handle. Replaces any previous
 /// response stored on the handle.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
+pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
     let Some(h) = handle_mut(handle) else {
-        return CurlrsCode::InvalidHandle;
+        return RsurlCode::InvalidHandle;
     };
     let Some(url) = h.url.as_deref() else {
-        return CurlrsCode::InvalidArg;
+        return RsurlCode::InvalidArg;
     };
     let method = h.method.clone().unwrap_or_else(|| {
         if h.body.is_some() {
@@ -244,8 +244,8 @@ pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
 
     let mut req = match Request::new(&method, url) {
         Ok(r) => r,
-        Err(crate::Error::UnsupportedScheme(_)) => return CurlrsCode::Unsupported,
-        Err(_) => return CurlrsCode::InvalidArg,
+        Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
+        Err(_) => return RsurlCode::InvalidArg,
     };
     for (k, v) in &h.headers {
         req = req.header(k, v);
@@ -269,14 +269,14 @@ pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
                 })
                 .collect();
             h.last_response = Some(resp);
-            CurlrsCode::Ok
+            RsurlCode::Ok
         }
-        Err(crate::Error::UnsupportedScheme(_)) => CurlrsCode::Unsupported,
-        Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => CurlrsCode::Network,
+        Err(crate::Error::UnsupportedScheme(_)) => RsurlCode::Unsupported,
+        Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => RsurlCode::Network,
         Err(crate::Error::BadResponse(_)) | Err(crate::Error::H2NotNegotiated) => {
-            CurlrsCode::BadResponse
+            RsurlCode::BadResponse
         }
-        Err(crate::Error::InvalidUrl(_)) => CurlrsCode::InvalidArg,
+        Err(crate::Error::InvalidUrl(_)) => RsurlCode::InvalidArg,
     }
 }
 
@@ -286,20 +286,20 @@ pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer returned by [`curlrs_easy_init`] and not yet
-/// freed by [`curlrs_easy_cleanup`]. `out_ptr` and `out_len` must be non-null
+/// `handle` must be a pointer returned by [`rsurl_easy_init`] and not yet
+/// freed by [`rsurl_easy_cleanup`]. `out_ptr` and `out_len` must be non-null
 /// and point to writable storage of the appropriate type.
 #[no_mangle]
-pub unsafe extern "C" fn curlrs_easy_response_body(
-    handle: *const CURLRS,
+pub unsafe extern "C" fn rsurl_easy_response_body(
+    handle: *const RSURL,
     out_ptr: *mut *const u8,
     out_len: *mut usize,
-) -> CurlrsCode {
+) -> RsurlCode {
     let Some(h) = handle_ref(handle) else {
-        return CurlrsCode::InvalidHandle;
+        return RsurlCode::InvalidHandle;
     };
     if out_ptr.is_null() || out_len.is_null() {
-        return CurlrsCode::InvalidArg;
+        return RsurlCode::InvalidArg;
     }
     match &h.last_response {
         Some(resp) => unsafe {
@@ -311,12 +311,12 @@ pub unsafe extern "C" fn curlrs_easy_response_body(
             *out_len = 0;
         },
     }
-    CurlrsCode::Ok
+    RsurlCode::Ok
 }
 
 /// Return the response HTTP status code, or 0 if no response is available.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_response_status(handle: *const CURLRS) -> c_long {
+pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
     handle_ref(handle)
         .and_then(|h| h.last_response.as_ref())
         .map(|r| r.status as c_long)
@@ -326,8 +326,8 @@ pub extern "C" fn curlrs_easy_response_status(handle: *const CURLRS) -> c_long {
 /// Borrow a pointer to a NUL-terminated `"Name: value"` header line by index.
 /// Returns NULL if `index` is out of range or no response is available.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_response_header(
-    handle: *const CURLRS,
+pub extern "C" fn rsurl_easy_response_header(
+    handle: *const RSURL,
     index: usize,
 ) -> *const c_char {
     let Some(h) = handle_ref(handle) else {
@@ -341,13 +341,13 @@ pub extern "C" fn curlrs_easy_response_header(
 
 /// Return the number of response headers available.
 #[no_mangle]
-pub extern "C" fn curlrs_easy_response_header_count(handle: *const CURLRS) -> usize {
+pub extern "C" fn rsurl_easy_response_header_count(handle: *const RSURL) -> usize {
     handle_ref(handle).map(|h| h.header_buf.len()).unwrap_or(0)
 }
 
 /// Return a static, NUL-terminated human-readable string for a status code.
 #[no_mangle]
-pub extern "C" fn curlrs_strerror(code: c_int) -> *const c_char {
+pub extern "C" fn rsurl_strerror(code: c_int) -> *const c_char {
     let s: &'static [u8] = match code {
         0 => b"ok\0",
         1 => b"invalid handle\0",
@@ -362,8 +362,8 @@ pub extern "C" fn curlrs_strerror(code: c_int) -> *const c_char {
     s.as_ptr() as *const c_char
 }
 
-/// Return the curlrs version as a NUL-terminated string.
+/// Return the rsurl version as a NUL-terminated string.
 #[no_mangle]
-pub extern "C" fn curlrs_version() -> *const c_char {
-    concat!("curlrs/", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+pub extern "C" fn rsurl_version() -> *const c_char {
+    concat!("rsurl/", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }

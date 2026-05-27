@@ -342,13 +342,13 @@ fn parse_epsv(text: &str) -> Option<u16> {
 }
 
 /// Split `user[:pass]` into `(user, pass)`, defaulting to anonymous /
-/// `curlrs@` (matching real curl's anonymous-FTP defaults).
+/// `rsurl@` (matching real curl's anonymous-FTP defaults).
 fn split_userinfo(ui: Option<&str>) -> (String, String) {
     match ui {
-        None => ("anonymous".to_string(), "curlrs@".to_string()),
+        None => ("anonymous".to_string(), "rsurl@".to_string()),
         Some(s) => match s.split_once(':') {
             Some((u, p)) => (u.to_string(), p.to_string()),
-            None => (s.to_string(), "curlrs@".to_string()),
+            None => (s.to_string(), "rsurl@".to_string()),
         },
     }
 }
@@ -461,14 +461,14 @@ mod tests {
     fn split_userinfo_defaults_to_anonymous() {
         let (u, p) = split_userinfo(None);
         assert_eq!(u, "anonymous");
-        assert_eq!(p, "curlrs@");
+        assert_eq!(p, "rsurl@");
     }
 
     #[test]
     fn split_userinfo_user_only() {
         let (u, p) = split_userinfo(Some("alice"));
         assert_eq!(u, "alice");
-        assert_eq!(p, "curlrs@");
+        assert_eq!(p, "rsurl@");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! curlrs — a pure-Rust implementation of curl.
+//! rsurl — a pure-Rust implementation of curl.
 //!
 //! Top-level entry points:
 //!   * HTTP/HTTPS — [`get`], [`request`], or [`Request`] / [`Response`] directly.

@@ -1,6 +1,6 @@
 name: Release-plz
 
-# DISABLED: the `curlrs` name on crates.io is currently held by a discontinued
+# DISABLED: the `rsurl` name on crates.io is currently held by a discontinued
 # project; ownership transfer is in flight. While we wait, only allow manual
 # dispatch — no auto-runs on push. Restore `push: branches: [master]` below
 # once we can publish.

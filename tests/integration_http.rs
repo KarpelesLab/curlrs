@@ -1,7 +1,7 @@
-//! Live HTTP/1.1 integration tests for curlrs.
+//! Live HTTP/1.1 integration tests for rsurl.
 //!
 //! Each test spins up a single-shot [`TestServer`] in `common/`, points a
-//! [`curlrs::Request`] at it, and asserts both directions of the wire.
+//! [`rsurl::Request`] at it, and asserts both directions of the wire.
 //! No external network is touched.
 
 mod common;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{BodyMode, Request as SReq, Response as SResp, TestServer};
 
-use curlrs::{Error, Request};
+use rsurl::{Error, Request};
 
 /// 200 OK with a Content-Length-framed body — the cheapest possible
 /// round-trip.
@@ -100,7 +100,7 @@ fn content_length_mismatch_short() {
 }
 
 /// No Content-Length, no Transfer-Encoding — the body runs until EOF
-/// (Connection: close). curlrs has to read to EOF.
+/// (Connection: close). rsurl has to read to EOF.
 #[test]
 fn close_delimited_body() {
     let server = TestServer::start(|_req: SReq| SResp {
@@ -175,7 +175,7 @@ fn request_headers_propagate() {
     let resp = Request::get(&server.url("/probe")).unwrap().send().unwrap();
     let text = String::from_utf8(resp.body).expect("ascii reflected headers");
 
-    let expected_ua = concat!("User-Agent: curlrs/", env!("CARGO_PKG_VERSION"));
+    let expected_ua = concat!("User-Agent: rsurl/", env!("CARGO_PKG_VERSION"));
     assert!(text.contains(expected_ua), "missing default UA in: {text}");
     assert!(text.contains("Accept: */*\n"), "missing Accept in: {text}");
     let expected_host = format!("Host: {}\n", server.addr);
@@ -205,7 +205,7 @@ fn custom_user_agent_overrides() {
     assert_eq!(resp.body, b"test/1");
     // And the default must not also appear (write_request has an
     // `have_ua` guard — this locks it in).
-    let default_ua = concat!("curlrs/", env!("CARGO_PKG_VERSION"));
+    let default_ua = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
     assert!(
         !resp
             .body

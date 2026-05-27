@@ -1,11 +1,11 @@
-//! Black-box tests for `curlrs::Url`.
+//! Black-box tests for `rsurl::Url`.
 //!
 //! These complement the in-module unit tests in `src/url.rs` by exercising
 //! cases the public API has to handle but that aren't already covered there:
 //! IPv6 literals, percent-encoded passthrough, query/fragment combinations,
 //! and a few negative cases.
 
-use curlrs::Url;
+use rsurl::Url;
 
 /// `[::1]:8080` is the canonical bracketed-IPv6 literal authority. We only
 /// assert what's stable across parser implementations: it parses without
@@ -25,7 +25,7 @@ fn ipv6_literal_with_port() {
     );
 }
 
-/// Percent-encoded path segments must be carried verbatim. curlrs does
+/// Percent-encoded path segments must be carried verbatim. rsurl does
 /// not double-encode or decode; the bytes you supply are the bytes that
 /// go on the wire.
 #[test]
@@ -36,7 +36,7 @@ fn percent_encoded_path_passthrough() {
     assert_eq!(u.path, "/foo%20bar/%2Fbaz?a=%26b");
 }
 
-/// A query string stays glued onto the path (curlrs doesn't split them);
+/// A query string stays glued onto the path (rsurl doesn't split them);
 /// a fragment is stripped.
 #[test]
 fn query_kept_fragment_stripped() {

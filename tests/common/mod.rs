@@ -1,11 +1,11 @@
-//! Tiny in-process HTTP/1.1 test server for curlrs integration tests.
+//! Tiny in-process HTTP/1.1 test server for rsurl integration tests.
 //!
 //! Design notes:
 //!
 //! * **Threading.** One acceptor thread, one worker thread per accepted
 //!   connection. Workers run synchronously and close the socket when done
 //!   (the response always advertises `Connection: close`, matching what
-//!   curlrs sends on the request side).
+//!   rsurl sends on the request side).
 //!
 //! * **Shutdown.** The acceptor sits on a non-blocking [`TcpListener`] with
 //!   a 50 ms poll loop driven by an [`AtomicBool`]. Drop of [`TestServer`]
@@ -23,13 +23,13 @@
 //!
 //! * **Parser.** Inline, ~50 LOC: reads up to a blank line, splits on CRLF,
 //!   handles `Content-Length` request bodies but not chunked uploads
-//!   (curlrs does not chunked-upload). Independent of curlrs's parser so a
+//!   (rsurl does not chunked-upload). Independent of rsurl's parser so a
 //!   bug on one side doesn't hide a bug on the other.
 //!
 //! Public API: [`TestServer::start`], the [`Request`] passed to the handler,
 //! [`Response`] with `ok` / `status` / etc. constructors, and `url(path)`
 //! which yields a `http://127.0.0.1:<port><path>` string ready for
-//! [`curlrs::Request::get`] et al.
+//! [`rsurl::Request::get`] et al.
 
 #![allow(dead_code)] // not every test exercises every helper
 
@@ -180,7 +180,7 @@ impl TestServer {
         let handler: Arc<Handler> = Arc::new(handler);
 
         let accept = thread::Builder::new()
-            .name("curlrs-testserver-accept".into())
+            .name("rsurl-testserver-accept".into())
             .spawn(move || {
                 accept_loop(listener, stop_for_loop, handler);
             })
@@ -226,7 +226,7 @@ fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, handler: Arc<Handle
                 // Each connection gets its own worker thread so a slow
                 // handler can't block the acceptor.
                 let _ = thread::Builder::new()
-                    .name("curlrs-testserver-worker".into())
+                    .name("rsurl-testserver-worker".into())
                     .spawn(move || {
                         handle_conn(stream, &*handler);
                     });

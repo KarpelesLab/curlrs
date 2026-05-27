@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::url::Url;
 
-const DEFAULT_USER_AGENT: &str = concat!("curlrs/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 

@@ -1190,7 +1190,7 @@ fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Res
     if !have_ua {
         fields.push((
             "user-agent".into(),
-            format!("curlrs/{}", env!("CARGO_PKG_VERSION")),
+            format!("rsurl/{}", env!("CARGO_PKG_VERSION")),
         ));
     }
     if !req.body.is_empty() {
@@ -1507,7 +1507,7 @@ mod tests {
             (":scheme".to_string(), "https".to_string()),
             (":authority".to_string(), "example.com".to_string()),
             (":path".to_string(), "/index.html".to_string()),
-            ("user-agent".to_string(), "curlrs/test".to_string()),
+            ("user-agent".to_string(), "rsurl/test".to_string()),
             ("x-custom".to_string(), "hello".to_string()),
         ];
         let wire = qpack::encode_field_section(&fields);

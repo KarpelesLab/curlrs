@@ -134,13 +134,13 @@ fn split_userinfo(ui: Option<&str>) -> (Option<&str>, Option<&str>) {
     }
 }
 
-/// Generate a fresh `curlrs-XXXXXXXXXXXX` client id (12 lowercase hex chars,
+/// Generate a fresh `rsurl-XXXXXXXXXXXX` client id (12 lowercase hex chars,
 /// 48 bits of randomness from the OS CSPRNG).
 fn random_client_id() -> String {
     let mut buf = [0u8; 6];
     OsRng.fill_bytes(&mut buf);
     let mut s = String::with_capacity(7 + 12);
-    s.push_str("curlrs-");
+    s.push_str("rsurl-");
     for b in buf {
         s.push(hex_nibble(b >> 4));
         s.push(hex_nibble(b & 0x0F));
@@ -444,8 +444,8 @@ mod tests {
     #[test]
     fn random_client_id_format() {
         let id = random_client_id();
-        assert!(id.starts_with("curlrs-"), "got {id}");
-        let suffix = &id["curlrs-".len()..];
+        assert!(id.starts_with("rsurl-"), "got {id}");
+        let suffix = &id["rsurl-".len()..];
         assert_eq!(suffix.len(), 12);
         assert!(suffix
             .chars()

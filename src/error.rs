@@ -4,7 +4,7 @@ use std::io;
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Errors that can occur during a curlrs request.
+/// Errors that can occur during a rsurl request.
 #[derive(Debug)]
 pub enum Error {
     /// URL was syntactically malformed (bad scheme, missing host, etc.).

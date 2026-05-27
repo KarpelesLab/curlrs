@@ -184,7 +184,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     // 2. Polite hello. The server may reply with 250 OK; ignore failures
     // (some servers don't implement CLIENT but still let us proceed).
-    let hello = format!("CLIENT curlrs/{}\r\n", env!("CARGO_PKG_VERSION"));
+    let hello = format!("CLIENT rsurl/{}\r\n", env!("CARGO_PKG_VERSION"));
     writer.write_all(hello.as_bytes())?;
     let _ = read_line(&mut reader)?; // discard whatever CLIENT returns
 

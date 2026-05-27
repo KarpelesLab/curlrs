@@ -51,7 +51,7 @@ mod tests {
             .unwrap_or(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("curlrs-file-{label}-{pid}-{nanos}-{n}"))
+        std::env::temp_dir().join(format!("rsurl-file-{label}-{pid}-{nanos}-{n}"))
     }
 
     fn url_for(path: &str, host: &str) -> Url {

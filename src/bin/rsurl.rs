@@ -1,4 +1,4 @@
-//! curlrs CLI — a (deliberately limited) curl-compatible front-end.
+//! rsurl CLI — a (deliberately limited) curl-compatible front-end.
 //!
 //! Supported options at this milestone:
 //!
@@ -31,7 +31,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use curlrs::{HttpVersionPref, Request, Response, Url};
+use rsurl::{HttpVersionPref, Request, Response, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -67,8 +67,8 @@ fn main() -> ExitCode {
     let args = match parse_args(&raw) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("curlrs: {e}");
-            eprintln!("try 'curlrs --help'");
+            eprintln!("rsurl: {e}");
+            eprintln!("try 'rsurl --help'");
             return ExitCode::from(2);
         }
     };
@@ -95,7 +95,7 @@ fn process_url(url: &str, args: &Args) -> u8 {
         Ok(u) => u,
         Err(e) => {
             if !args.silent {
-                eprintln!("curlrs: {e}");
+                eprintln!("rsurl: {e}");
             }
             return 3;
         }
@@ -121,7 +121,7 @@ fn process_url(url: &str, args: &Args) -> u8 {
         Ok(r) => r,
         Err(e) => {
             if !args.silent {
-                eprintln!("curlrs: {e}");
+                eprintln!("rsurl: {e}");
             }
             return 3;
         }
@@ -185,7 +185,7 @@ fn process_url(url: &str, args: &Args) -> u8 {
         Ok(r) => r,
         Err(e) => {
             if !args.silent {
-                eprintln!("curlrs: {e}");
+                eprintln!("rsurl: {e}");
             }
             return 7;
         }
@@ -199,7 +199,7 @@ fn process_url(url: &str, args: &Args) -> u8 {
 
     if let Err(e) = write_output(&resp, &parsed_url, args) {
         if !args.silent {
-            eprintln!("curlrs: write error: {e}");
+            eprintln!("rsurl: write error: {e}");
         }
         return 23;
     }
@@ -217,7 +217,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("curlrs {VERSION}");
+                println!("rsurl {VERSION}");
                 std::process::exit(0);
             }
             "-o" | "--output" => {
@@ -296,14 +296,14 @@ fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String,
 }
 
 fn run_transfer(url: &str, args: &Args) -> u8 {
-    match curlrs::transfer(url) {
+    match rsurl::transfer(url) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
                 Some(path) if path != "-" => match File::create(path) {
                     Ok(f) => Box::new(f),
                     Err(e) => {
                         if !args.silent {
-                            eprintln!("curlrs: open {path}: {e}");
+                            eprintln!("rsurl: open {path}: {e}");
                         }
                         return 23;
                     }
@@ -312,7 +312,7 @@ fn run_transfer(url: &str, args: &Args) -> u8 {
             };
             if let Err(e) = out.write_all(&bytes) {
                 if !args.silent {
-                    eprintln!("curlrs: write error: {e}");
+                    eprintln!("rsurl: write error: {e}");
                 }
                 return 23;
             }
@@ -320,7 +320,7 @@ fn run_transfer(url: &str, args: &Args) -> u8 {
         }
         Err(e) => {
             if !args.silent {
-                eprintln!("curlrs: {e}");
+                eprintln!("rsurl: {e}");
             }
             7
         }
@@ -375,9 +375,9 @@ fn remote_name_from_url(url: &Url) -> Result<String, String> {
 
 fn print_usage() {
     println!(
-        "curlrs {VERSION} — a pure-Rust curl
+        "rsurl {VERSION} — a pure-Rust curl
 
-Usage: curlrs [options] <url>...
+Usage: rsurl [options] <url>...
 
 Options:
   -o, --output <file>      write body to file instead of stdout
