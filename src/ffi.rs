@@ -326,10 +326,7 @@ pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
 /// Borrow a pointer to a NUL-terminated `"Name: value"` header line by index.
 /// Returns NULL if `index` is out of range or no response is available.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_response_header(
-    handle: *const RSURL,
-    index: usize,
-) -> *const c_char {
+pub extern "C" fn rsurl_easy_response_header(handle: *const RSURL, index: usize) -> *const c_char {
     let Some(h) = handle_ref(handle) else {
         return ptr::null();
     };
