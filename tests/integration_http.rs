@@ -272,16 +272,8 @@ fn verbose_trace_format() {
 /// downstream consumers don't think the body is still compressed.
 #[test]
 fn gzip_response_is_decoded() {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
     let plain = b"hello compressed world".to_vec();
-    let gz = {
-        let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(&plain).unwrap();
-        e.finish().unwrap()
-    };
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
 
     let plain_for_server = plain.clone();
     let gz_for_server = gz.clone();
@@ -319,16 +311,8 @@ fn gzip_response_is_decoded() {
 /// Same wire shape but with `deflate` (zlib-wrapped, RFC 9110 form).
 #[test]
 fn deflate_response_is_decoded() {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
     let plain = b"deflate body".to_vec();
-    let z = {
-        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-        e.write_all(&plain).unwrap();
-        e.finish().unwrap()
-    };
+    let z = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&plain).unwrap();
 
     let z_for_server = z.clone();
     let server = TestServer::start(move |_req: SReq| {

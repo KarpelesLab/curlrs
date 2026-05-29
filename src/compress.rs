@@ -23,7 +23,12 @@
 
 use std::io::Read;
 
-use flate2::read::{GzDecoder, ZlibDecoder};
+use compcol::deflate::Deflate;
+use compcol::gzip::Gzip;
+use compcol::io::DecoderReader;
+use compcol::limit::LimitedDecoder;
+use compcol::zlib::Zlib;
+use compcol::Algorithm;
 
 use crate::error::{Error, Result};
 use crate::http::MAX_BODY_BYTES;
@@ -117,13 +122,20 @@ impl Layer {
     }
 }
 
-fn gunzip(src: &[u8]) -> Result<Vec<u8>> {
+/// One-shot decode of `src` with algorithm `A`, capping the decompressed
+/// output at [`MAX_BODY_BYTES`] via compcol's [`LimitedDecoder`]. The
+/// streaming `DecoderReader` adapter exposes a `std::io::Read` so we can
+/// reuse the standard `read_to_end` machinery.
+fn decode_with<A: Algorithm>(src: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(src.len().saturating_mul(3));
-    GzDecoder::new(src)
-        .take(MAX_BODY_BYTES as u64)
-        .read_to_end(&mut out)
-        .map_err(|e| Error::BadResponse(format!("gzip decode failed: {e}")))?;
+    let dec = LimitedDecoder::new(A::decoder(), MAX_BODY_BYTES as u64);
+    let mut reader = DecoderReader::new(src, dec);
+    reader.read_to_end(&mut out)?;
     Ok(out)
+}
+
+fn gunzip(src: &[u8]) -> Result<Vec<u8>> {
+    decode_with::<Gzip>(src).map_err(|e| Error::BadResponse(format!("gzip decode failed: {e}")))
 }
 
 /// Decode a `deflate`-encoded body. RFC 9110 says HTTP `deflate` is **zlib**
@@ -131,20 +143,12 @@ fn gunzip(src: &[u8]) -> Result<Vec<u8>> {
 /// emit raw deflate without the zlib header. Try the zlib framing first;
 /// if it fails, retry as raw deflate so we interoperate with both camps.
 fn inflate_zlib(src: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(src.len().saturating_mul(3));
-    let zlib_err = match ZlibDecoder::new(src)
-        .take(MAX_BODY_BYTES as u64)
-        .read_to_end(&mut out)
-    {
-        Ok(_) => return Ok(out),
+    let zlib_err = match decode_with::<Zlib>(src) {
+        Ok(out) => return Ok(out),
         Err(e) => e,
     };
-    out.clear();
-    flate2::read::DeflateDecoder::new(src)
-        .take(MAX_BODY_BYTES as u64)
-        .read_to_end(&mut out)
-        .map_err(|_| Error::BadResponse(format!("deflate decode failed: {zlib_err}")))?;
-    Ok(out)
+    decode_with::<Deflate>(src)
+        .map_err(|_| Error::BadResponse(format!("deflate decode failed: {zlib_err}")))
 }
 
 /// Strip `Content-Encoding` and `Content-Length` from a response header
@@ -165,26 +169,18 @@ pub(crate) fn strip_after_decode(headers: Vec<(String, String)>) -> Vec<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
-    use flate2::Compression;
-    use std::io::Write;
+    use compcol::vec::compress_to_vec;
 
     fn gz(data: &[u8]) -> Vec<u8> {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        enc.finish().unwrap()
+        compress_to_vec::<Gzip>(data).expect("gzip encode")
     }
 
     fn zlib(data: &[u8]) -> Vec<u8> {
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        enc.finish().unwrap()
+        compress_to_vec::<Zlib>(data).expect("zlib encode")
     }
 
     fn raw_deflate(data: &[u8]) -> Vec<u8> {
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        enc.finish().unwrap()
+        compress_to_vec::<Deflate>(data).expect("deflate encode")
     }
 
     #[test]
