@@ -1303,6 +1303,50 @@ fn write_request<W: Write>(
     Ok(())
 }
 
+/// Read one line (through and including the terminating `\n`) into `buf`,
+/// appending to whatever is already there, but refusing to grow the read past
+/// `max` bytes without seeing a `\n`. Returns the number of bytes read.
+///
+/// Unlike [`BufRead::read_line`], which grows its `String` until `\n` or EOF
+/// with no in-flight cap, this errors out as soon as `max` bytes have been
+/// consumed without a newline. That prevents a malicious or MITM server from
+/// streaming an endless newline-free line to exhaust memory (DoS).
+///
+/// A return of `0` means EOF was hit before any byte was read (same contract as
+/// `read_line`). The bytes are appended UTF-8-lossily, matching `read_line`'s
+/// behaviour for the well-formed ASCII protocol lines we parse here.
+fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut String, max: usize) -> Result<usize> {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        // Cap the amount read in this call by what's left of the budget, plus
+        // one byte so a line of exactly `max` data bytes + `\n` still fits.
+        let remaining = max.saturating_sub(raw.len());
+        let n = r
+            .by_ref()
+            .take(remaining as u64 + 1)
+            .read_until(b'\n', &mut raw)?;
+        if n == 0 {
+            // EOF.
+            break;
+        }
+        if raw.last() == Some(&b'\n') {
+            // Found the line terminator.
+            break;
+        }
+        if raw.len() > max {
+            return Err(Error::BadResponse("response line exceeds 64 KiB".into()));
+        }
+        // Otherwise `take` capped us mid-line but we're still under budget;
+        // loop to read more.
+    }
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    let read = raw.len();
+    buf.push_str(&String::from_utf8_lossy(&raw));
+    Ok(read)
+}
+
 /// Read one HTTP/1.1 response from a buffered stream. The buffer is held by
 /// the caller (rather than created inline) because connection-reuse hands
 /// the same `BufReader` to back-to-back requests, and the buffer's leftover
@@ -1313,7 +1357,7 @@ fn read_response<R: Read>(
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut status_line = String::new();
-    let n = r.read_line(&mut status_line)?;
+    let n = read_line_capped(r, &mut status_line, MAX_HEADER_BYTES)?;
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
@@ -1325,7 +1369,7 @@ fn read_response<R: Read>(
     let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        let n = r.read_line(&mut line)?;
+        let n = read_line_capped(r, &mut line, MAX_HEADER_BYTES)?;
         if n == 0 {
             return Err(Error::UnexpectedEof);
         }
@@ -1517,7 +1561,7 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
-        let n = r.read_line(&mut size_line)?;
+        let n = read_line_capped(r, &mut size_line, MAX_HEADER_BYTES)?;
         if n == 0 {
             return Err(Error::UnexpectedEof);
         }
@@ -1535,7 +1579,7 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
             // Consume trailers until empty line.
             loop {
                 let mut t = String::new();
-                let n = r.read_line(&mut t)?;
+                let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
                 if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
                     break;
                 }
@@ -1760,6 +1804,70 @@ mod tests {
         ];
         let mut r = BufReader::new(Cursor::new(b"abcd".to_vec()));
         assert!(read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").is_err());
+    }
+
+    #[test]
+    fn read_line_capped_errors_on_overlong_line() {
+        use std::io::Cursor;
+        // A line with no '\n' that exceeds the cap must error, not grow forever.
+        let huge = vec![b'a'; MAX_HEADER_BYTES + 4096];
+        let mut r = BufReader::new(Cursor::new(huge));
+        let mut buf = String::new();
+        let err = read_line_capped(&mut r, &mut buf, MAX_HEADER_BYTES).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_line_capped_reads_normal_line_and_eof() {
+        use std::io::Cursor;
+        let mut r = BufReader::new(Cursor::new(b"hello\r\nworld".to_vec()));
+        let mut a = String::new();
+        let n = read_line_capped(&mut r, &mut a, MAX_HEADER_BYTES).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(a, "hello\r\n");
+        // Second line has no terminator; we return it on EOF like read_line.
+        let mut b = String::new();
+        let n = read_line_capped(&mut r, &mut b, MAX_HEADER_BYTES).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(b, "world");
+        // Now truly EOF -> 0.
+        let mut c = String::new();
+        let n = read_line_capped(&mut r, &mut c, MAX_HEADER_BYTES).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_response_rejects_overlong_status_line() {
+        use std::io::Cursor;
+        // A status line that never contains '\n' and blows past the cap must
+        // yield an Err rather than hang or exhaust memory.
+        let huge = vec![b'X'; MAX_HEADER_BYTES + 4096];
+        let mut r = BufReader::new(Cursor::new(huge));
+        let mut trace = Vec::new();
+        let err = read_response(&mut r, "GET", &mut trace).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_response_rejects_overlong_header_line() {
+        use std::io::Cursor;
+        // Valid status line, then a single header line that never terminates.
+        let mut bytes = b"HTTP/1.1 200 OK\r\n".to_vec();
+        bytes.extend(std::iter::repeat(b'a').take(MAX_HEADER_BYTES + 4096));
+        let mut r = BufReader::new(Cursor::new(bytes));
+        let mut trace = Vec::new();
+        let err = read_response(&mut r, "GET", &mut trace).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_chunked_rejects_overlong_size_line() {
+        use std::io::Cursor;
+        // A chunk-size line that never terminates must error, not OOM.
+        let huge = vec![b'f'; MAX_HEADER_BYTES + 4096];
+        let mut r = BufReader::new(Cursor::new(huge));
+        let err = read_chunked(&mut r).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
     }
 
     #[test]
