@@ -9,9 +9,9 @@
 //! does not directly cover APPLICATION-class tags used pervasively by LDAP).
 //!
 //! Scope of this module: a single Bind + Search + Unbind round-trip. The
-//! filter parser handles `(attr=value)`, `(attr=*)` (present), and boolean
-//! combinations `(&...)`, `(|...)`, `(!...)`. Substring (`(cn=foo*bar)`)
-//! and extensible match are not implemented.
+//! filter parser handles `(attr=value)` (equality), `(attr=*)` (present),
+//! substrings (`(cn=foo*bar*baz)`, RFC 4511 §4.5.1), and boolean combinations
+//! `(&...)`, `(|...)`, `(!...)`. Extensible match is not implemented.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -391,7 +391,19 @@ enum Filter {
     And(Vec<Filter>),
     Or(Vec<Filter>),
     Not(Box<Filter>),
-    EqualityMatch { attr: String, value: String },
+    EqualityMatch {
+        attr: String,
+        value: String,
+    },
+    /// RFC 4511 §4.5.1 substrings filter. At most one `initial` (leading
+    /// segment before the first `*`) and one `final` (trailing segment after
+    /// the last `*`); zero or more `any` segments in between.
+    Substrings {
+        attr: String,
+        initial: Option<String>,
+        any: Vec<String>,
+        final_: Option<String>,
+    },
     Present(String),
 }
 
@@ -499,13 +511,43 @@ impl<'a> FilterParser<'a> {
         let value_raw = std::str::from_utf8(&self.bytes[vstart..self.pos])
             .map_err(|_| Error::BadResponse("filter: non-utf8 value".into()))?
             .to_string();
+        // A bare `*` is the presence filter, NOT a substring match.
         if value_raw == "*" {
             return Ok(Filter::Present(attr));
         }
         if value_raw.contains('*') {
-            return Err(Error::BadResponse(
-                "filter: substring matches not supported".into(),
-            ));
+            // Substrings filter (RFC 4511 §4.5.1). Split on `*` into segments.
+            // The leading non-empty segment is `initial`; the trailing one is
+            // `final`; non-empty interior segments are `any` (in order). Empty
+            // segments (from leading/trailing/consecutive `*`) contribute
+            // nothing. The equality path does no RFC 4515 de-escaping, so for
+            // parity neither do we: every `*` is treated as a wildcard.
+            let segments: Vec<&str> = value_raw.split('*').collect();
+            let last = segments.len() - 1;
+            let mut initial = None;
+            let mut any = Vec::new();
+            let mut final_ = None;
+            for (i, seg) in segments.iter().enumerate() {
+                if seg.is_empty() {
+                    continue;
+                }
+                // Each assertion value is BER-encoded into the request; reject
+                // embedded control bytes the same as every other filter field.
+                reject_ctl(seg, "filter substring segment")?;
+                if i == 0 {
+                    initial = Some(seg.to_string());
+                } else if i == last {
+                    final_ = Some(seg.to_string());
+                } else {
+                    any.push(seg.to_string());
+                }
+            }
+            return Ok(Filter::Substrings {
+                attr,
+                initial,
+                any,
+                final_,
+            });
         }
         Ok(Filter::EqualityMatch {
             attr,
@@ -551,6 +593,36 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
             write_constructed(out, tag::ctx(3, true), |w| {
                 write_octet_string(w, attr.as_bytes());
                 write_octet_string(w, value.as_bytes());
+            });
+        }
+        Filter::Substrings {
+            attr,
+            initial,
+            any,
+            final_,
+        } => {
+            // [4] SubstringFilter ::= SEQUENCE {
+            //   type AttributeDescription,
+            //   substrings SEQUENCE OF CHOICE {
+            //     initial [0] AssertionValue,
+            //     any     [1] AssertionValue,
+            //     final   [2] AssertionValue } }
+            write_constructed(out, tag::ctx(4, true), |w| {
+                write_octet_string(w, attr.as_bytes());
+                write_constructed(w, tag::SEQUENCE, |subs| {
+                    if let Some(s) = initial {
+                        // initial [0] -- primitive octet string
+                        write_tlv(subs, tag::ctx(0, false), s.as_bytes());
+                    }
+                    for s in any {
+                        // any [1] -- primitive octet string
+                        write_tlv(subs, tag::ctx(1, false), s.as_bytes());
+                    }
+                    if let Some(s) = final_ {
+                        // final [2] -- primitive octet string
+                        write_tlv(subs, tag::ctx(2, false), s.as_bytes());
+                    }
+                });
             });
         }
         Filter::Present(attr) => {
@@ -1134,8 +1206,206 @@ mod tests {
     }
 
     #[test]
-    fn parse_filter_substring_unsupported() {
-        assert!(parse_filter("(cn=al*ce)").is_err());
+    fn parse_filter_substring_initial_only() {
+        let f = parse_filter("(cn=foo*)").unwrap();
+        assert_eq!(
+            f,
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: Some("foo".into()),
+                any: vec![],
+                final_: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_substring_final_only() {
+        let f = parse_filter("(cn=*bar)").unwrap();
+        assert_eq!(
+            f,
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: None,
+                any: vec![],
+                final_: Some("bar".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_substring_initial_any_final() {
+        let f = parse_filter("(cn=a*b*c)").unwrap();
+        assert_eq!(
+            f,
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: Some("a".into()),
+                any: vec!["b".into()],
+                final_: Some("c".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_substring_any_only() {
+        let f = parse_filter("(cn=*x*)").unwrap();
+        assert_eq!(
+            f,
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: None,
+                any: vec!["x".into()],
+                final_: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_substring_multiple_any() {
+        // Consecutive `**` and leading/trailing `*` contribute no element.
+        let f = parse_filter("(cn=**a**b**)").unwrap();
+        assert_eq!(
+            f,
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: None,
+                any: vec!["a".into(), "b".into()],
+                final_: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_present_not_substring() {
+        // A bare `*` is the presence filter, not a substring filter.
+        let f = parse_filter("(cn=*)").unwrap();
+        assert_eq!(f, Filter::Present("cn".into()));
+    }
+
+    #[test]
+    fn parse_filter_no_star_stays_equality() {
+        let f = parse_filter("(cn=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::EqualityMatch {
+                attr: "cn".into(),
+                value: "foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_substring_rejects_control_bytes() {
+        // A control byte inside a substring segment is rejected by reject_ctl.
+        assert!(parse_filter("(cn=foo\n*bar)").is_err());
+        assert!(parse_filter("(cn=foo*ba\0r)").is_err());
+    }
+
+    /// Encode a standalone filter and return the BER bytes for tag inspection.
+    fn encode_one(f: &Filter) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_filter(&mut out, f);
+        out
+    }
+
+    #[test]
+    fn encode_substring_initial_only_tags() {
+        // (cn=foo*) -> [4] constructed (0xA4) { type, SEQUENCE { initial [0] } }
+        let f = parse_filter("(cn=foo*)").unwrap();
+        let buf = encode_one(&f);
+        assert_eq!(buf[0], 0xA4, "substring filter tag must be [4] constructed");
+        assert_eq!(buf[0], tag::ctx(4, true));
+        let mut r = BerReader::new(&buf);
+        let sub = r.read_expect(tag::ctx(4, true)).unwrap();
+        let mut sr = BerReader::new(sub);
+        assert_eq!(sr.read_octet_string().unwrap(), b"cn");
+        let seq = sr.read_expect(tag::SEQUENCE).unwrap();
+        let mut subs = BerReader::new(seq);
+        let init = subs.read_tlv().unwrap();
+        assert_eq!(init.tag, 0x80, "initial must be [0] primitive");
+        assert_eq!(init.tag, tag::ctx(0, false));
+        assert_eq!(init.value, b"foo");
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn encode_substring_final_only_tags() {
+        // (cn=*bar) -> SEQUENCE { final [2] }
+        let f = parse_filter("(cn=*bar)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let sub = r.read_expect(tag::ctx(4, true)).unwrap();
+        let mut sr = BerReader::new(sub);
+        assert_eq!(sr.read_octet_string().unwrap(), b"cn");
+        let seq = sr.read_expect(tag::SEQUENCE).unwrap();
+        let mut subs = BerReader::new(seq);
+        let fin = subs.read_tlv().unwrap();
+        assert_eq!(fin.tag, 0x82, "final must be [2] primitive");
+        assert_eq!(fin.tag, tag::ctx(2, false));
+        assert_eq!(fin.value, b"bar");
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn encode_substring_initial_any_final_tags() {
+        // (cn=a*b*c) -> initial [0]=0x80, any [1]=0x81, final [2]=0x82 in order
+        let f = parse_filter("(cn=a*b*c)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let sub = r.read_expect(tag::ctx(4, true)).unwrap();
+        let mut sr = BerReader::new(sub);
+        assert_eq!(sr.read_octet_string().unwrap(), b"cn");
+        let seq = sr.read_expect(tag::SEQUENCE).unwrap();
+        let mut subs = BerReader::new(seq);
+        let init = subs.read_tlv().unwrap();
+        assert_eq!(init.tag, 0x80);
+        assert_eq!(init.value, b"a");
+        let mid = subs.read_tlv().unwrap();
+        assert_eq!(mid.tag, 0x81, "any must be [1] primitive");
+        assert_eq!(mid.value, b"b");
+        let fin = subs.read_tlv().unwrap();
+        assert_eq!(fin.tag, 0x82);
+        assert_eq!(fin.value, b"c");
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn encode_substring_any_only_tag() {
+        // (cn=*x*) -> SEQUENCE { any [1] }
+        let f = parse_filter("(cn=*x*)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let sub = r.read_expect(tag::ctx(4, true)).unwrap();
+        let mut sr = BerReader::new(sub);
+        assert_eq!(sr.read_octet_string().unwrap(), b"cn");
+        let seq = sr.read_expect(tag::SEQUENCE).unwrap();
+        let mut subs = BerReader::new(seq);
+        let any = subs.read_tlv().unwrap();
+        assert_eq!(any.tag, 0x81);
+        assert_eq!(any.value, b"x");
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn encode_present_tag() {
+        // (cn=*) -> present [7] primitive = 0x87
+        let f = parse_filter("(cn=*)").unwrap();
+        let buf = encode_one(&f);
+        assert_eq!(buf[0], 0x87, "present filter tag must be [7] primitive");
+        assert_eq!(buf[0], tag::ctx(7, false));
+        let mut r = BerReader::new(&buf);
+        let tlv = r.read_tlv().unwrap();
+        assert_eq!(tlv.value, b"cn");
+    }
+
+    #[test]
+    fn encode_equality_tag() {
+        // (cn=foo) -> equalityMatch [3] constructed = 0xA3
+        let f = parse_filter("(cn=foo)").unwrap();
+        let buf = encode_one(&f);
+        assert_eq!(buf[0], 0xA3);
+        assert_eq!(buf[0], tag::ctx(3, true));
     }
 
     #[test]

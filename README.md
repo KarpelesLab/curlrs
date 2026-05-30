@@ -33,7 +33,7 @@ Early, in active development.
 | DICT (RFC 2229) | working | DEFINE, MATCH, SHOW DATABASES |
 | GOPHER / GOPHERS (RFC 1436) | working | reads to EOF; item-type 7 search via `?<words>` (sends `selector\t<words>`) |
 | IMAP / IMAPS (RFC 9051) | working | LOGIN + LIST / SELECT+FETCH / UID FETCH BODY[] |
-| LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; subset of filter syntax |
+| LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; filter syntax: equality, presence, substring (`cn=foo*bar*`), and `& \| !` (extensible match excluded) |
 | MQTT / MQTTS (v3.1.1) | working | CONNECT, SUBSCRIBE, receive one PUBLISH (QoS 0) |
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
 | RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
