@@ -72,6 +72,12 @@ rsurl -x http://proxy:3128 http://x/    # plain HTTP via proxy (absolute-form)
 rsurl -x http://proxy:3128 https://x/   # HTTPS via proxy CONNECT tunnel
 rsurl --proxy-user u:p -x http://proxy:3128 https://x/   # Proxy-Authorization
 rsurl --noproxy localhost,.internal -x http://proxy https://x/  # bypass list
+rsurl -d a=1 -d b=2 http://api/         # urlencoded POST, multiple values
+rsurl --data-binary @blob.bin http://api/   # send file bytes verbatim
+rsurl --data-urlencode "q=hello world" http://api/   # encoded form value
+rsurl -F "txt=hi" -F "file=@photo.jpg" http://api/   # multipart upload
+rsurl --form-string "lit=@notafile" http://api/      # literal value, no @ magic
+rsurl -T payload.json http://api/items/42            # PUT file as body
 rsurl file:///etc/hostname              # local file
 rsurl dict://dict.org/d:curl            # dictionary lookup
 rsurl gopher://gopher.floodgap.com/     # gopher menu
@@ -82,11 +88,16 @@ Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
 `-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--max-time`,
 `--connect-timeout`, `-O`/`--remote-name`, `-b`/`--cookie` /
 `-c`/`--cookie-jar` for Netscape-format cookie I/O, and `-x`/`--proxy`
-/ `--proxy-user` / `--noproxy` for HTTP proxying. The usual env vars —
-`HTTPS_PROXY`, lowercase `http_proxy` (for CGI safety), `ALL_PROXY`,
-`NO_PROXY` — are honoured when `-x` is not given. Multiple URLs on one
-command line are processed sequentially, with the cookie jar shared
-across them.
+/ `--proxy-user` / `--noproxy` for HTTP proxying. Body flags cover
+`-d`/`--data`, `--data-raw`, `--data-binary`, `--data-urlencode`,
+`-F`/`--form` with the full curl-canonical `;type=`, `;filename=`,
+`;headers=@file` modifier syntax, `--form-string` (literal value, no
+`@`/`<`/`;` parsing), `--form-escape` (RFC 7578 §4.2 percent-encoding
+for names and filenames), and `-T`/`--upload-file` for straight PUT
+uploads. The usual env vars — `HTTPS_PROXY`, lowercase `http_proxy`
+(for CGI safety), `ALL_PROXY`, `NO_PROXY` — are honoured when `-x` is
+not given. Multiple URLs on one command line are processed
+sequentially, with the cookie jar shared across them.
 
 ## C usage
 

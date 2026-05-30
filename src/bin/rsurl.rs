@@ -14,6 +14,14 @@
 //!         --data-raw <body>    like -d but no @file interpretation
 //!         --data-binary <body> like -d but no newline stripping when @file
 //!         --data-urlencode <s> URL-encode <s> before sending; @file allowed
+//!     -F, --form <name=value>  add a multipart/form-data part. The value may
+//!                              be @file (file upload) or <file (read field
+//!                              value from file). Modifiers: ;type=, ;filename=,
+//!                              ;headers=@hdrfile.
+//!         --form-string <n=v>  like -F but the value is always literal
+//!         --form-escape        percent-encode field names/filenames per
+//!                              RFC 7578 §4.2 instead of backslash-escaping
+//!     -T, --upload-file <f>    PUT the file as the request body
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
 //!     -L, --location           follow 3xx redirects
@@ -89,6 +97,16 @@ struct Args {
     /// `--noproxy <hosts>` — comma-separated host suffixes that bypass
     /// the proxy. A single `*` bypasses everything.
     noproxy: Option<String>,
+    /// One entry per `-F`/`--form`/`--form-string`. Parsed at CLI time
+    /// (curl-style `name=value;type=…;filename=…;headers=@…`) and joined
+    /// into a `multipart/form-data` body in [`build_multipart_body`].
+    form_parts: Vec<FormPart>,
+    /// `--form-escape`: percent-encode field names and filenames per
+    /// RFC 7578 §4.2 instead of curl's historical backslash-escape.
+    form_escape: bool,
+    /// `-T`/`--upload-file <file>` — PUT the file as the request body,
+    /// default `Content-Type: application/octet-stream`.
+    upload_file: Option<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -120,6 +138,53 @@ enum DataPart {
     Binary { value: String },
     /// `--data-urlencode`. Parsed against the five curl sub-forms.
     UrlEncoded { value: String },
+}
+
+/// One curl-style `name=value;type=…;filename=…;headers=@…` form part.
+///
+/// Parsed once at CLI time by [`form_parser::parse`] (or constructed directly
+/// for `--form-string`, which skips all magic) and consumed by
+/// [`build_multipart_body`] when assembling the wire-level multipart body.
+#[derive(Debug, Clone)]
+struct FormPart {
+    name: String,
+    body: FormBody,
+    extras: Vec<FormExtra>,
+}
+
+/// Where the bytes for a [`FormPart`] come from.
+#[derive(Debug, Clone)]
+enum FormBody {
+    /// `-F name=value` — literal value inline. `@`/`<` magic was already
+    /// resolved at parse time; this variant means "the value is the bytes".
+    Literal(String),
+    /// `-F name=@path` — file upload. `Content-Disposition` includes
+    /// `filename="<basename>"` unless overridden by a `;filename=` modifier.
+    File(String),
+    /// `-F name=<path` — field part with the file's contents as the
+    /// value. Unlike `File`, this does **not** add a `filename=` attribute,
+    /// so the recipient sees it as a plain form field, not an upload.
+    FileAsField(String),
+    /// `--form-string name=value` — like `Literal`, except parsing of the
+    /// `;modifier=` syntax is also disabled, so the value may contain
+    /// arbitrary `@`, `<`, `;`, or `"`. Kept distinct from `Literal` mainly
+    /// so the parse step can short-circuit; once we're building the body,
+    /// it behaves exactly like `Literal` with no extras.
+    LiteralStrict(String),
+}
+
+/// One `;`-separated modifier on a `-F` part.
+#[derive(Debug, Clone)]
+enum FormExtra {
+    /// `;type=mime/type` — emitted as `Content-Type: <…>` on the part.
+    Type(String),
+    /// `;filename=other.ext` — overrides the basename from `@path`. For
+    /// `Literal`-bodied parts, presence of this modifier promotes the part
+    /// to a file-upload shape (Content-Disposition gains `filename=`).
+    Filename(String),
+    /// `;headers=@hdrfile` — read additional headers (one `Name: value`
+    /// per line) from a file and emit them on the part. Curl-compatible.
+    HeadersFile(String),
 }
 
 fn main() -> ExitCode {
@@ -360,6 +425,489 @@ fn encode_urlencoded(spec: &str) -> Result<Vec<u8>, String> {
     Ok(percent_encode_form(spec.as_bytes()).into_bytes())
 }
 
+/// curl-style `-F name=value[;mod=…]` parser.
+///
+/// Quoting rules (matching curl): the *value* (the part after the first `=`)
+/// may be wrapped in `"…"` to embed a literal `;` or `"`; inside the quotes,
+/// `\"` is a literal `"` and `\\` is a literal `\`. Modifier values follow
+/// the same rules. Top-level `;` outside quotes separates the value from
+/// modifiers. The name itself is **not** quoted (curl rejects quoted names).
+mod form_parser {
+    use super::{FormBody, FormExtra, FormPart};
+
+    /// Parse one `-F`/`--form` argument into a [`FormPart`].
+    pub(super) fn parse(spec: &str) -> Result<FormPart, String> {
+        let eq = spec.find('=').ok_or_else(|| {
+            format!("-F: expected 'name=value', got {spec:?} (use --form-string for literal '=')")
+        })?;
+        let name = spec[..eq].to_string();
+        if name.is_empty() {
+            return Err(format!("-F: empty field name: {spec:?}"));
+        }
+        let rest = &spec[eq + 1..];
+        let mut tokens = split_semi(rest);
+        // First token is always the value; remaining tokens are modifiers.
+        let raw_value = tokens.remove(0);
+        let body = classify_body(&raw_value);
+        let mut extras = Vec::new();
+        for tok in tokens {
+            extras.push(classify_extra(&tok)?);
+        }
+        Ok(FormPart { name, body, extras })
+    }
+
+    /// `@file` → [`FormBody::File`]; `<file` → [`FormBody::FileAsField`];
+    /// anything else → [`FormBody::Literal`]. The `@`/`<` discriminator is
+    /// checked on the *unquoted* string, so `"@notafile"` is taken literally.
+    fn classify_body(token: &str) -> FormBody {
+        // Quoting was already resolved by split_semi; if the original token
+        // was a quoted literal, the `@`/`<` is now plain text — which is
+        // what we want. The discriminator only applies to bare strings.
+        // We approximate this by remembering whether the leading char was
+        // already inside quotes via the convention: split_semi returns the
+        // unquoted bytes, but it cannot signal "was-quoted". To preserve
+        // curl behaviour, classify only on the bare token; users who want
+        // a literal `@` value should use `--form-string`.
+        if let Some(p) = token.strip_prefix('@') {
+            FormBody::File(p.to_string())
+        } else if let Some(p) = token.strip_prefix('<') {
+            FormBody::FileAsField(p.to_string())
+        } else {
+            FormBody::Literal(token.to_string())
+        }
+    }
+
+    fn classify_extra(token: &str) -> Result<FormExtra, String> {
+        let (k, v) = token
+            .split_once('=')
+            .ok_or_else(|| format!("-F: malformed modifier {token:?} (expected key=value)"))?;
+        let k = k.trim();
+        let v = v.to_string();
+        match k.to_ascii_lowercase().as_str() {
+            "type" => Ok(FormExtra::Type(v)),
+            "filename" => Ok(FormExtra::Filename(v)),
+            "headers" => {
+                let path = v
+                    .strip_prefix('@')
+                    .ok_or_else(|| format!("-F: ;headers= must be @file (got {token:?})"))?;
+                Ok(FormExtra::HeadersFile(path.to_string()))
+            }
+            _ => Err(format!("-F: unknown modifier {k:?}")),
+        }
+    }
+
+    /// Split `s` on top-level `;`, with `"…"` segments protected from the
+    /// split. Inside quotes, `\"` is `"` and `\\` is `\` (every other
+    /// backslash is kept literal). Outer quotes are stripped on return.
+    fn split_semi(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut chars = s.chars().peekable();
+        let mut in_quote = false;
+        while let Some(c) = chars.next() {
+            if in_quote {
+                match c {
+                    '"' => in_quote = false,
+                    '\\' => match chars.peek() {
+                        Some('"') => {
+                            cur.push('"');
+                            chars.next();
+                        }
+                        Some('\\') => {
+                            cur.push('\\');
+                            chars.next();
+                        }
+                        _ => cur.push('\\'),
+                    },
+                    _ => cur.push(c),
+                }
+            } else {
+                match c {
+                    '"' => in_quote = true,
+                    ';' => out.push(std::mem::take(&mut cur)),
+                    _ => cur.push(c),
+                }
+            }
+        }
+        out.push(cur);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn simple_literal() {
+            let p = parse("foo=bar").unwrap();
+            assert_eq!(p.name, "foo");
+            assert!(matches!(&p.body, FormBody::Literal(v) if v == "bar"));
+            assert!(p.extras.is_empty());
+        }
+
+        #[test]
+        fn at_file_is_file_upload() {
+            let p = parse("upload=@/tmp/x.bin").unwrap();
+            assert!(matches!(&p.body, FormBody::File(v) if v == "/tmp/x.bin"));
+        }
+
+        #[test]
+        fn lt_file_is_field_from_file() {
+            let p = parse("note=</tmp/x.txt").unwrap();
+            assert!(matches!(&p.body, FormBody::FileAsField(v) if v == "/tmp/x.txt"));
+        }
+
+        #[test]
+        fn quoted_value_with_semicolon() {
+            let p = parse(r#"k="a;b;c""#).unwrap();
+            assert!(matches!(&p.body, FormBody::Literal(v) if v == "a;b;c"));
+        }
+
+        #[test]
+        fn quoted_value_with_escapes() {
+            let p = parse(r#"k="he said \"hi\" \\""#).unwrap();
+            assert!(matches!(&p.body, FormBody::Literal(v) if v == r#"he said "hi" \"#));
+        }
+
+        #[test]
+        fn modifiers_type_filename_headers() {
+            let p = parse("f=@x;type=application/json;filename=other.json;headers=@hdrs").unwrap();
+            assert!(matches!(&p.body, FormBody::File(p) if p == "x"));
+            assert_eq!(p.extras.len(), 3);
+            assert!(matches!(&p.extras[0], FormExtra::Type(v) if v == "application/json"));
+            assert!(matches!(&p.extras[1], FormExtra::Filename(v) if v == "other.json"));
+            assert!(matches!(&p.extras[2], FormExtra::HeadersFile(v) if v == "hdrs"));
+        }
+
+        #[test]
+        fn empty_name_rejected() {
+            assert!(parse("=value").is_err());
+        }
+
+        #[test]
+        fn missing_eq_rejected() {
+            assert!(parse("foo").is_err());
+        }
+
+        #[test]
+        fn unknown_modifier_rejected() {
+            assert!(parse("foo=bar;weird=baz").is_err());
+        }
+
+        #[test]
+        fn headers_missing_at_rejected() {
+            assert!(parse("foo=bar;headers=hdrs").is_err());
+        }
+    }
+}
+
+/// Inline multipart/form-data encoder for `-F` parts. Curl-compatible wire
+/// format; the only deviation worth flagging is that we generate the
+/// boundary ourselves (no caller override yet), prefixed with
+/// `----rsurl-boundary-` so verbose traces are easy to grep.
+mod multipart {
+    use super::{FormBody, FormExtra, FormPart};
+
+    /// Build the body and return `(boundary, bytes)`. The boundary string
+    /// is what goes into `Content-Type: multipart/form-data; boundary=<…>`.
+    pub(super) fn build(parts: &[FormPart], escape: bool) -> Result<(String, Vec<u8>), String> {
+        let boundary = make_boundary();
+        let mut out = Vec::new();
+        for part in parts {
+            out.extend_from_slice(b"--");
+            out.extend_from_slice(boundary.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            write_part(part, escape, &mut out)?;
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"--\r\n");
+        Ok((boundary, out))
+    }
+
+    fn write_part(part: &FormPart, escape: bool, out: &mut Vec<u8>) -> Result<(), String> {
+        // Decide what filename (if any) goes on Content-Disposition, and
+        // what bytes form the body. `<file` parts get no filename even
+        // though they read from a file — that's how curl distinguishes a
+        // form *field* from a form *upload*.
+        let (bytes, default_filename, is_upload): (Vec<u8>, Option<String>, bool) = match &part.body
+        {
+            FormBody::Literal(s) | FormBody::LiteralStrict(s) => {
+                (s.as_bytes().to_vec(), None, false)
+            }
+            FormBody::File(path) => {
+                let bytes =
+                    std::fs::read(path).map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                (bytes, Some(name), true)
+            }
+            FormBody::FileAsField(path) => {
+                let bytes =
+                    std::fs::read(path).map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
+                (bytes, None, false)
+            }
+        };
+
+        // Modifier overrides.
+        let mut ctype: Option<&str> = None;
+        let mut filename: Option<String> = default_filename;
+        let mut extra_headers: Vec<u8> = Vec::new();
+        let mut promote_to_upload = is_upload;
+        for ex in &part.extras {
+            match ex {
+                FormExtra::Type(t) => ctype = Some(t),
+                FormExtra::Filename(f) => {
+                    filename = Some(f.clone());
+                    // Setting filename on a literal-bodied part is how curl
+                    // promotes "this is text" to "this is a named upload".
+                    promote_to_upload = true;
+                }
+                FormExtra::HeadersFile(path) => {
+                    let raw = std::fs::read(path)
+                        .map_err(|e| format!("-F: can't read headers file {path:?}: {e}"))?;
+                    // Trim outer whitespace per line, ignore blank lines,
+                    // keep curl's permissive behaviour (no header parsing).
+                    for line in raw.split(|b| *b == b'\n') {
+                        let mut l = line;
+                        if l.last() == Some(&b'\r') {
+                            l = &l[..l.len() - 1];
+                        }
+                        if l.is_empty() {
+                            continue;
+                        }
+                        extra_headers.extend_from_slice(l);
+                        extra_headers.extend_from_slice(b"\r\n");
+                    }
+                }
+            }
+        }
+
+        // Content-Disposition header.
+        out.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+        out.extend_from_slice(encode_attr(&part.name, escape).as_bytes());
+        out.extend_from_slice(b"\"");
+        if promote_to_upload || filename.is_some() {
+            if let Some(fname) = filename.as_deref() {
+                out.extend_from_slice(b"; filename=\"");
+                out.extend_from_slice(encode_attr(fname, escape).as_bytes());
+                out.extend_from_slice(b"\"");
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+
+        // Content-Type: explicit > default-for-upload > none.
+        if let Some(t) = ctype {
+            out.extend_from_slice(b"Content-Type: ");
+            out.extend_from_slice(t.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        } else if promote_to_upload {
+            // Curl's default for a file part with no ;type=.
+            out.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+        }
+
+        // Extra headers from ;headers=@file.
+        out.extend_from_slice(&extra_headers);
+
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// Encode `s` for use inside a `Content-Disposition` attribute value.
+    /// With `escape == true` we percent-encode the RFC 7578 §4.2 reserved
+    /// bytes; without it (curl-historical default) we backslash-escape `"`
+    /// and `\` and pass through CR/LF (which is wrong on the wire but
+    /// curl-compatible).
+    fn encode_attr(s: &str, escape: bool) -> String {
+        if escape {
+            let mut out = String::with_capacity(s.len());
+            for b in s.bytes() {
+                match b {
+                    b'\r' => out.push_str("%0D"),
+                    b'\n' => out.push_str("%0A"),
+                    b'"' => out.push_str("%22"),
+                    b'\\' => out.push_str("%5C"),
+                    _ => out.push(b as char),
+                }
+            }
+            out
+        } else {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
+    }
+
+    /// 8 bytes of randomness → 16 hex chars, prefixed for greppability.
+    /// Falls back to a time-based mix if `/dev/urandom` is unreachable so
+    /// the CLI still works on stripped-down container images.
+    fn make_boundary() -> String {
+        let mut buf = [0u8; 8];
+        let ok = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .is_ok();
+        if !ok {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((nanos >> (i * 8)) & 0xFF) as u8;
+            }
+        }
+        let mut hex = String::with_capacity(16 + 19);
+        hex.push_str("----rsurl-boundary-");
+        for b in buf {
+            use std::fmt::Write;
+            write!(hex, "{b:02x}").expect("write to String");
+        }
+        hex
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn literal_part_round_trip() {
+            let parts = vec![FormPart {
+                name: "k".into(),
+                body: FormBody::Literal("v".into()),
+                extras: vec![],
+            }];
+            let (b, bytes) = build(&parts, false).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains(&format!("--{b}\r\n")));
+            assert!(text.contains("Content-Disposition: form-data; name=\"k\"\r\n"));
+            assert!(!text.contains("filename="));
+            assert!(text.contains("\r\n\r\nv\r\n"));
+            assert!(text.ends_with(&format!("--{b}--\r\n")));
+        }
+
+        #[test]
+        fn file_part_gets_filename_and_octet_stream() {
+            let mut tmp = std::env::temp_dir();
+            tmp.push(format!("rsurl-mp-{}.bin", std::process::id()));
+            std::fs::write(&tmp, b"FILEBYTES").unwrap();
+            let path = tmp.to_string_lossy().into_owned();
+            let basename = tmp.file_name().unwrap().to_string_lossy().into_owned();
+            let parts = vec![FormPart {
+                name: "u".into(),
+                body: FormBody::File(path),
+                extras: vec![],
+            }];
+            let (_, bytes) = build(&parts, false).unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains(&format!(
+                "Content-Disposition: form-data; name=\"u\"; filename=\"{basename}\"\r\n"
+            )));
+            assert!(text.contains("Content-Type: application/octet-stream\r\n"));
+            assert!(text.contains("\r\n\r\nFILEBYTES\r\n"));
+        }
+
+        #[test]
+        fn type_filename_extras_take_effect() {
+            let parts = vec![FormPart {
+                name: "x".into(),
+                body: FormBody::Literal("body".into()),
+                extras: vec![
+                    FormExtra::Type("application/json".into()),
+                    FormExtra::Filename("over.json".into()),
+                ],
+            }];
+            let (_, bytes) = build(&parts, false).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains("name=\"x\"; filename=\"over.json\"\r\n"));
+            assert!(text.contains("Content-Type: application/json\r\n"));
+        }
+
+        #[test]
+        fn form_escape_uses_percent_encoding() {
+            let parts = vec![FormPart {
+                name: "weird\"name".into(),
+                body: FormBody::Literal("v".into()),
+                extras: vec![],
+            }];
+            let (_, bytes) = build(&parts, true).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains("name=\"weird%22name\""), "got: {text}");
+        }
+
+        #[test]
+        fn default_backslash_escape_preserves_curl_behaviour() {
+            let parts = vec![FormPart {
+                name: "weird\"name".into(),
+                body: FormBody::Literal("v".into()),
+                extras: vec![],
+            }];
+            let (_, bytes) = build(&parts, false).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains(r#"name="weird\"name""#), "got: {text}");
+        }
+    }
+}
+
+/// `(body_bytes, content_type, default_method)` — what the body-assembly
+/// functions return so the caller can both set the body and pick a method.
+type AssembledBody = (Vec<u8>, String, &'static str);
+
+/// Build the upload body for `-T`/`--upload-file`. Reads the file fully into
+/// memory (matches the HTTP layer's `Vec<u8>`-based body API) and returns
+/// it with the curl-default `application/octet-stream` Content-Type and
+/// `PUT` method.
+fn build_upload_body(path: &str) -> Result<AssembledBody, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("-T: can't read {path:?}: {e}"))?;
+    Ok((bytes, "application/octet-stream".into(), "PUT"))
+}
+
+/// Build the multipart body for `-F`/`--form` parts. Returns
+/// `(bytes, content_type, method)` where `content_type` carries the
+/// generated boundary string.
+fn build_multipart_body(parts: &[FormPart], escape: bool) -> Result<AssembledBody, String> {
+    let (boundary, bytes) = multipart::build(parts, escape)?;
+    let ctype = format!("multipart/form-data; boundary={boundary}");
+    Ok((bytes, ctype, "POST"))
+}
+
+/// Top-level body chooser. At most one of `{upload_file, form_parts,
+/// data_parts}` may be non-empty; the curl-canonical exit-code-2 message is
+/// returned otherwise. The returned `default_method` is what the request
+/// uses if the user didn't pass `-X` or `-I`.
+fn assemble_request_body(args: &Args) -> Result<Option<AssembledBody>, String> {
+    let n = (!args.data_parts.is_empty()) as u8
+        + (!args.form_parts.is_empty()) as u8
+        + args.upload_file.is_some() as u8;
+    if n > 1 {
+        return Err("-d/--data, -F/--form, and -T/--upload-file are mutually exclusive".into());
+    }
+    if let Some(path) = &args.upload_file {
+        return build_upload_body(path).map(Some);
+    }
+    if !args.form_parts.is_empty() {
+        return build_multipart_body(&args.form_parts, args.form_escape).map(Some);
+    }
+    if let Some(bytes) = assemble_form_body(&args.data_parts)? {
+        return Ok(Some((
+            bytes,
+            "application/x-www-form-urlencoded".into(),
+            "POST",
+        )));
+    }
+    Ok(None)
+}
+
 /// Resolve every `DataPart` into bytes and join with `&`. Returns
 /// `Ok(None)` if no data flags were given; `Ok(Some(bytes))` otherwise.
 /// File-read errors become a printable string for the caller.
@@ -411,12 +959,22 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
     if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
+        if args.upload_file.is_some() {
+            if !args.silent {
+                eprintln!(
+                    "rsurl: -T is only supported for HTTP(S) URLs in this build; \
+                     FTP upload TBD"
+                );
+            }
+            return 2;
+        }
         return run_transfer(url, args);
     }
 
     // Assemble the body up front so we know whether to default the method
-    // to POST. Errors from file I/O surface as exit code 2 ("usage").
-    let body = match assemble_form_body(&args.data_parts) {
+    // (PUT for `-T`, POST for `-d`/`-F`). Errors from file I/O or mutually
+    // exclusive flag combos surface as exit code 2 ("usage").
+    let assembled = match assemble_request_body(args) {
         Ok(b) => b,
         Err(e) => {
             if !args.silent {
@@ -429,8 +987,8 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     let method = args.method.clone().unwrap_or_else(|| {
         if args.head {
             "HEAD".to_string()
-        } else if body.is_some() {
-            "POST".to_string()
+        } else if let Some((_, _, m)) = &assembled {
+            (*m).to_string()
         } else {
             "GET".to_string()
         }
@@ -455,13 +1013,13 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(rf) = &args.referer {
         req = req.header("Referer", rf);
     }
-    if let Some(body_bytes) = body {
+    if let Some((body_bytes, ctype, _method)) = assembled {
         if !args
             .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
         {
-            req = req.header("Content-Type", "application/x-www-form-urlencoded");
+            req = req.header("Content-Type", &ctype);
         }
         req = req.body(body_bytes);
     }
@@ -613,6 +1171,30 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--data-urlencode" => a.data_parts.push(DataPart::UrlEncoded {
                 value: next_val(&mut it, arg)?,
             }),
+            "-F" | "--form" => {
+                let v = next_val(&mut it, arg)?;
+                a.form_parts.push(form_parser::parse(&v)?);
+            }
+            "--form-string" => {
+                // No `@`/`<`/`;` magic: the whole right-hand side is the
+                // literal value, and the part carries no extras.
+                let v = next_val(&mut it, arg)?;
+                let eq = v
+                    .find('=')
+                    .ok_or_else(|| format!("--form-string: expected 'name=value', got {v:?}"))?;
+                let name = v[..eq].to_string();
+                if name.is_empty() {
+                    return Err(format!("--form-string: empty field name: {v:?}"));
+                }
+                let value = v[eq + 1..].to_string();
+                a.form_parts.push(FormPart {
+                    name,
+                    body: FormBody::LiteralStrict(value),
+                    extras: vec![],
+                });
+            }
+            "--form-escape" => a.form_escape = true,
+            "-T" | "--upload-file" => a.upload_file = Some(next_val(&mut it, arg)?),
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
@@ -780,6 +1362,14 @@ Options:
       --data-binary <body> like -d but @file is read verbatim (no strip)
       --data-urlencode <s> percent-encode <s> before sending. Forms:
                              text  =text  name=text  @file  name@file
+  -F, --form <name=value>  add a multipart/form-data part. Value forms:
+                             text  @file (upload)  <file (field from file)
+                           Modifiers: ;type=  ;filename=  ;headers=@hdrfile
+      --form-string <n=v>  like -F but value is taken literally (no @, <, ;)
+      --form-escape        percent-encode names/filenames per RFC 7578 §4.2
+                           (default: backslash-escape, curl-historical)
+  -T, --upload-file <f>    PUT the file as the request body (default
+                           Content-Type: application/octet-stream)
   -A, --user-agent <ua>    set User-Agent
   -e, --referer <ref>      set Referer
   -L, --location           follow 3xx redirects

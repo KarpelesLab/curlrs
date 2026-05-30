@@ -781,3 +781,278 @@ fn cli_multiple_d_join_with_ampersand() {
     assert_eq!(got.0, "POST");
     assert_eq!(got.2, b"a=1&b=2&c=3");
 }
+
+// ---------------------------------------------------------------------------
+// CLI subprocess tests for -F / --form, --form-string, -T / --upload-file
+// ---------------------------------------------------------------------------
+
+/// Pull the boundary string out of `multipart/form-data; boundary=…`.
+fn extract_boundary(ct: &str) -> String {
+    let lc = ct.to_ascii_lowercase();
+    let prefix = "boundary=";
+    let i = lc.find(prefix).expect("boundary= in Content-Type");
+    let mut rest = &ct[i + prefix.len()..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        rest = stripped;
+        let end = rest.find('"').expect("closing quote on boundary");
+        rest[..end].to_string()
+    } else {
+        // Boundary runs until the next ';' or end-of-line.
+        let end = rest.find(';').unwrap_or(rest.len());
+        rest[..end].trim().to_string()
+    }
+}
+
+/// Locate one multipart part by `name="<name>"` and return the slice from
+/// after that line's CRLF through the part's terminating CRLF (excluding the
+/// trailing `--<boundary>` glue). Tests then split header / body inside that.
+fn find_part<'a>(body: &'a [u8], boundary: &str, needle: &str) -> &'a [u8] {
+    let sep = format!("--{boundary}\r\n");
+    let term = format!("--{boundary}--");
+    let body_str =
+        std::str::from_utf8(body).expect("multipart body should be UTF-8 in these tests");
+    // Find the right part by scanning. Split on the leading boundary; each
+    // chunk is one part (the first chunk is empty, before the first boundary).
+    let mut chunks = body_str.split(&sep);
+    let _ = chunks.next(); // skip the empty preamble
+    for chunk in chunks {
+        if chunk.contains(needle) {
+            // Strip everything from the terminating boundary onward.
+            let end = chunk.find(&term).unwrap_or(chunk.len());
+            // Also strip the trailing CRLF before the boundary.
+            let mut end_no_crlf = end;
+            if end_no_crlf >= 2 && &chunk[end_no_crlf - 2..end_no_crlf] == "\r\n" {
+                end_no_crlf -= 2;
+            }
+            // Also handle "--boundary" form (no leading \r\n separator
+            // because we split on "--boundary\r\n" already). The actual
+            // close marker for an interior part is "\r\n--boundary".
+            return &chunk.as_bytes()[..end_no_crlf];
+        }
+    }
+    panic!("no part matched: {needle:?}");
+}
+
+/// `-F name=@path` uploads the file's bytes as a multipart part, with
+/// `Content-Disposition` carrying the basename as `filename=` and a
+/// default `Content-Type: application/octet-stream`.
+#[test]
+fn cli_form_part_with_at_file_uploads_bytes() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-form-{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(b"PAYLOAD-BYTES").unwrap();
+    }
+    let basename = tmp.file_name().unwrap().to_string_lossy().into_owned();
+    let arg = format!("upload=@{}", tmp.display());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-F", &arg, &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    let ct = got.1.expect("Content-Type set");
+    assert!(
+        ct.starts_with("multipart/form-data; boundary="),
+        "got Content-Type: {ct}"
+    );
+    let boundary = extract_boundary(&ct);
+    let part = find_part(&got.2, &boundary, "name=\"upload\"");
+    let part_str = std::str::from_utf8(part).expect("ascii part headers");
+    let expected_disposition =
+        format!("Content-Disposition: form-data; name=\"upload\"; filename=\"{basename}\"\r\n");
+    assert!(
+        part_str.contains(&expected_disposition),
+        "missing disposition in part: {part_str}"
+    );
+    assert!(
+        part_str.contains("Content-Type: application/octet-stream\r\n"),
+        "missing default Content-Type in part: {part_str}"
+    );
+    assert!(
+        part.ends_with(b"\r\n\r\nPAYLOAD-BYTES"),
+        "part body should end with the uploaded bytes; got: {part_str}"
+    );
+}
+
+/// `--form-string name=@notafile` must put the literal string `@notafile`
+/// in the part value — no file read, no `@` magic, no `;modifier` parsing.
+#[test]
+fn cli_form_string_treats_at_as_literal() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "--form-string",
+            "field=@notafile;type=ignored",
+            &server.url("/post"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    let ct = got.1.expect("Content-Type set");
+    let boundary = extract_boundary(&ct);
+    let part = find_part(&got.2, &boundary, "name=\"field\"");
+    let s = std::str::from_utf8(part).unwrap();
+    // No filename promotion, no Content-Type defaulting, value is the
+    // literal — `;type=ignored` is part of the bytes, not a modifier.
+    assert!(
+        !s.contains("filename="),
+        "literal form-string must not become an upload: {s}"
+    );
+    assert!(!s.contains("Content-Type:"), "no auto Content-Type: {s}");
+    assert!(
+        s.ends_with("\r\n\r\n@notafile;type=ignored"),
+        "literal value must appear verbatim: {s}"
+    );
+}
+
+/// All three modifiers should pass through to the part: `;type=` sets the
+/// Content-Type, `;filename=` overrides the basename, `;headers=@file`
+/// injects extra header lines.
+#[test]
+fn cli_form_extras_type_filename_headers() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut payload = std::env::temp_dir();
+    payload.push(format!("rsurl-form-payload-{}.txt", std::process::id()));
+    std::fs::write(&payload, b"DATA").unwrap();
+
+    let mut hdrs = std::env::temp_dir();
+    hdrs.push(format!("rsurl-form-hdrs-{}.txt", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&hdrs).unwrap();
+        f.write_all(b"X-Custom: yes\r\nX-Other: 42\r\n").unwrap();
+    }
+
+    let arg = format!(
+        "f=@{};type=application/json;filename=other.json;headers=@{}",
+        payload.display(),
+        hdrs.display()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-F", &arg, &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&payload);
+    let _ = std::fs::remove_file(&hdrs);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    let ct = got.1.expect("Content-Type set");
+    let boundary = extract_boundary(&ct);
+    let part = find_part(&got.2, &boundary, "name=\"f\"");
+    let s = std::str::from_utf8(part).unwrap();
+    assert!(
+        s.contains("name=\"f\"; filename=\"other.json\"\r\n"),
+        "filename override missing: {s}"
+    );
+    assert!(
+        s.contains("Content-Type: application/json\r\n"),
+        "type modifier missing: {s}"
+    );
+    assert!(
+        s.contains("X-Custom: yes\r\n"),
+        "header injection missing: {s}"
+    );
+    assert!(
+        s.contains("X-Other: 42\r\n"),
+        "header injection missing: {s}"
+    );
+    assert!(s.ends_with("\r\n\r\nDATA"), "body bytes wrong: {s}");
+}
+
+/// `-T file` PUTs the file's bytes as the request body with
+/// `Content-Type: application/octet-stream`.
+#[test]
+fn cli_upload_file_uses_put_and_octet_stream() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-upload-{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        // Bytes that include CR/LF/NUL to prove no stripping happens.
+        f.write_all(b"AAA\r\nBBB\n\0CCC").unwrap();
+    }
+    let path = tmp.to_string_lossy().into_owned();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-T", &path, &server.url("/put")])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "PUT");
+    assert_eq!(got.1.as_deref(), Some("application/octet-stream"));
+    assert_eq!(got.2, b"AAA\r\nBBB\n\0CCC");
+}
+
+/// `-T` plus a non-HTTP URL is a usage error (exit code 2) and mentions
+/// the flag in the message so the user knows what to fix.
+#[test]
+fn cli_upload_file_rejects_non_http() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-T", "/etc/hostname", "ftp://example.invalid/foo"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(code, Some(2), "expected exit code 2, got {code:?}");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("-T"), "stderr should mention -T: {err}");
+}
+
+/// Combining `-F` and `-d` (or `-T` and either) must be rejected with a
+/// usage error rather than silently building something nonsensical.
+#[test]
+fn cli_form_and_data_are_mutually_exclusive() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-d", "a=1", "-F", "b=2", "http://127.0.0.1:1/post"])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(2), "expected exit 2");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("mutually exclusive"),
+        "stderr should explain conflict: {err}"
+    );
+}
