@@ -1059,6 +1059,49 @@ fn cli_upload_file_ftp_attempts_transfer() {
     );
 }
 
+/// `-a`/`--append` with an `ftp://` URL routes to the FTP upload path (APPE).
+/// With an unresolvable host it fails at the connect step (exit 7), proving the
+/// append branch is reached rather than rejected as a usage error.
+#[test]
+fn cli_append_ftp_attempts_transfer() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-a", "-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(7),
+        "expected transfer error exit 7, got {code:?}"
+    );
+}
+
+/// `-a` combined with `-C <offset>` for an FTP upload is accepted: APPE takes
+/// precedence over REST, so the offset is ignored rather than causing an error.
+/// Still reaches the FTP transfer path (exit 7 against an unresolvable host).
+#[test]
+fn cli_append_with_continue_at_prefers_appe() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-a",
+            "-C",
+            "10",
+            "-T",
+            "/etc/hostname",
+            "ftp://host.invalid/foo",
+        ])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(7),
+        "expected transfer error exit 7 (APPE ignores -C), got {code:?}"
+    );
+}
+
 /// `-C -` (curl's automatic-resume form) is rejected at parse time with a
 /// clear usage error, since automatic resume isn't implemented.
 #[test]

@@ -24,6 +24,7 @@
 //!                              RFC 7578 §4.2 instead of backslash-escaping
 //!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, TFTP WRQ, or MQTT PUBLISH)
 //!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
+//!     -a, --append             FTP/FTPS upload: append (APPE) instead of STOR
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
 //!     -L, --location           follow 3xx redirects
@@ -113,6 +114,11 @@ struct Args {
     /// For FTP uploads this sends `REST <offset>` before `STOR`. The curl
     /// "automatic" form `-C -` is not supported and is rejected at parse time.
     continue_at: Option<u64>,
+    /// `-a`/`--append` — for FTP/FTPS uploads (`-T`), append to the remote file
+    /// via `APPE` instead of replacing it via `STOR`. A no-op for non-FTP
+    /// uploads, matching curl (whose `-a` only applies to FTP/FTPS/SFTP).
+    /// `APPE` negotiates no offset, so it takes precedence over `-C`/REST.
+    append: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1236,6 +1242,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                         .map_err(|_| format!("-C/--continue-at: not a byte offset: {v:?}"))?,
                 );
             }
+            "-a" | "--append" => a.append = true,
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
@@ -1304,9 +1311,12 @@ fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String,
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
-/// Upload a local file to an `ftp://`/`ftps://` URL via STOR. With
-/// `-C <offset>` the local source is seeked past `offset` bytes and a
-/// `REST <offset>` is sent so the server resumes/appends from there. Returns a
+/// Upload a local file to an `ftp://`/`ftps://` URL. By default this is `STOR`
+/// (replace/create); with `-C <offset>` the local source is seeked past
+/// `offset` bytes and a `REST <offset>` is sent so the server resumes from
+/// there. With `-a`/`--append` it's `APPE` instead, which appends the whole
+/// file to the remote — `APPE` negotiates no offset, so `-a` takes precedence
+/// over `-C` (any `-C` is ignored and the full file is streamed). Returns a
 /// curl-style exit code (0 ok, 7 on transfer error, 26 on local-read error).
 fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match std::fs::read(path) {
@@ -1319,26 +1329,33 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
         }
     };
 
-    // For REST resume, only the tail past `offset` is streamed; the server
-    // already holds the first `offset` bytes.
-    let (body, resume_at): (&[u8], Option<u64>) = match args.continue_at {
-        Some(off) => {
-            let off_usize = off as usize;
-            if off_usize > bytes.len() {
-                if !args.silent {
-                    eprintln!(
-                        "rsurl: -C {off}: offset is past the end of {path:?} ({} bytes)",
-                        bytes.len()
-                    );
+    // APPE wins over REST: append always streams the whole file and lets the
+    // server tack it onto whatever is already there, so -C is ignored here.
+    let result = if args.append {
+        rsurl::ftp::append(url, &bytes)
+    } else {
+        // For REST resume, only the tail past `offset` is streamed; the server
+        // already holds the first `offset` bytes.
+        let (body, resume_at): (&[u8], Option<u64>) = match args.continue_at {
+            Some(off) => {
+                let off_usize = off as usize;
+                if off_usize > bytes.len() {
+                    if !args.silent {
+                        eprintln!(
+                            "rsurl: -C {off}: offset is past the end of {path:?} ({} bytes)",
+                            bytes.len()
+                        );
+                    }
+                    return 2;
                 }
-                return 2;
+                (&bytes[off_usize..], Some(off))
             }
-            (&bytes[off_usize..], Some(off))
-        }
-        None => (&bytes[..], None),
+            None => (&bytes[..], None),
+        };
+        rsurl::ftp::store(url, body, resume_at)
     };
 
-    match rsurl::ftp::store(url, body, resume_at) {
+    match result {
         Ok(()) => 0,
         Err(e) => {
             if !args.silent {
@@ -1573,6 +1590,8 @@ Options:
                            or MQTT PUBLISH
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            the automatic form '-C -' is not supported
+  -a, --append             FTP/FTPS upload: append (APPE) instead of replacing
+                           (STOR). No-op for other protocols; overrides -C
   -A, --user-agent <ua>    set User-Agent
   -e, --referer <ref>      set Referer
   -L, --location           follow 3xx redirects

@@ -11,8 +11,9 @@
 //!   * `RETR` for files, `LIST` for paths ending in `/`.
 //!
 //! Uploads use `STOR` (see [`store`]), with optional `REST <offset>` resume
-//! when the caller supplies a byte offset. Explicit `AUTH TLS` upgrade and
-//! active mode (`PORT`/`EPRT`) are intentionally not implemented yet.
+//! when the caller supplies a byte offset, or `APPE` (see [`append`]) to
+//! append to an existing remote file. Explicit `AUTH TLS` upgrade and active
+//! mode (`PORT`/`EPRT`) are intentionally not implemented yet.
 //!
 //! For TLS we use [`crate::tls::connect_over`] on both the control channel
 //! (on connect, for implicit FTPS) and the data channel (using the host
@@ -213,16 +214,50 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Build the `STOR <path>` command for an upload, stripping a single leading
-/// '/' the way curl does (the FTP path after login is relative to the login
-/// directory). Returns `None` for an empty or directory-only path, which can't
-/// name a file to store.
-fn stor_command(path: &str) -> Option<String> {
+/// Which upload verb to issue: `STOR` (overwrite/create, optionally after a
+/// `REST` resume offset) or `APPE` (append to an existing file, or create it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadMode {
+    /// `STOR` — replace the remote file (or, after `REST`, resume at an offset).
+    Stor,
+    /// `APPE` — append the streamed bytes to the remote file. No offset is
+    /// negotiated, so `REST`/`-C` does not apply.
+    Appe,
+}
+
+impl UploadMode {
+    /// The FTP verb word (`"STOR"` / `"APPE"`) for command lines and errors.
+    fn verb(self) -> &'static str {
+        match self {
+            UploadMode::Stor => "STOR",
+            UploadMode::Appe => "APPE",
+        }
+    }
+}
+
+/// Build the `STOR <path>` / `APPE <path>` command for an upload, stripping a
+/// single leading '/' the way curl does (the FTP path after login is relative
+/// to the login directory). Returns `None` for an empty or directory-only
+/// path, which can't name a file to upload.
+fn upload_command(mode: UploadMode, path: &str) -> Option<String> {
     let name = path.strip_prefix('/').unwrap_or(path);
     if name.is_empty() || name.ends_with('/') {
         return None;
     }
-    Some(format!("STOR {name}"))
+    Some(format!("{} {name}", mode.verb()))
+}
+
+/// Build the `STOR <path>` command. Thin wrapper over [`upload_command`] kept
+/// for the descriptive name at the test sites that pin STOR's exact wire form.
+#[cfg(test)]
+fn stor_command(path: &str) -> Option<String> {
+    upload_command(UploadMode::Stor, path)
+}
+
+/// Build the `APPE <path>` command (same path validation as [`stor_command`]).
+#[cfg(test)]
+fn appe_command(path: &str) -> Option<String> {
+    upload_command(UploadMode::Appe, path)
 }
 
 /// Format the `REST <offset>` resume command.
@@ -238,26 +273,49 @@ fn rest_command(offset: u64) -> String {
 /// [`fetch`], so the data connection is dialed back to the control peer and
 /// wrapped in TLS for `ftps` exactly as RETR does.
 pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
+    upload(url, body, UploadMode::Stor, resume_at)
+}
+
+/// Append `body` to the file at `url.path` via `APPE`, creating it if absent.
+///
+/// Unlike [`store`], `APPE` negotiates no offset: the server appends the
+/// streamed bytes to whatever is already there, so `REST`/`-C` is irrelevant
+/// and the full `body` is always sent. Otherwise shares login, binary mode,
+/// and the passive-open/TLS-wrap logic with [`fetch`] and [`store`].
+pub fn append(url: &Url, body: &[u8]) -> Result<()> {
+    upload(url, body, UploadMode::Appe, None)
+}
+
+/// Shared upload driver for `STOR` and `APPE`. Logs in, optionally sends
+/// `REST <offset>` (STOR resume only), opens the passive data connection,
+/// issues the verb, streams `body`, and reads the completion reply.
+///
+/// `resume_at` is honored only for [`UploadMode::Stor`]; `APPE` ignores it
+/// (the public [`append`] entry point always passes `None`).
+fn upload(url: &Url, body: &[u8], mode: UploadMode, resume_at: Option<u64>) -> Result<()> {
     let mut con = connect_login(url)?;
 
     // Determine the remote filename up front and reject control bytes so it
-    // can't break out of the STOR command line.
+    // can't break out of the STOR/APPE command line.
     reject_ctl(&url.path, "ftp path")?;
-    let cmd = stor_command(&url.path).ok_or_else(|| {
+    let cmd = upload_command(mode, &url.path).ok_or_else(|| {
         Error::BadResponse(format!(
-            "ftp STOR: URL path {:?} does not name a file to upload",
+            "ftp {}: URL path {:?} does not name a file to upload",
+            mode.verb(),
             url.path
         ))
     })?;
 
     // REST before STOR for resume. Per RFC 3659 the server answers 350
     // ("restart marker accepted"); the next command (STOR) then proceeds from
-    // that offset.
-    if let Some(offset) = resume_at {
-        send(&mut con.ctrl, &rest_command(offset))?;
-        let (c, m) = read_reply(&mut con.ctrl)?;
-        if c != 350 {
-            return Err(Error::BadResponse(format!("ftp REST: {c} {m}")));
+    // that offset. APPE negotiates no offset, so it never sends REST.
+    if mode == UploadMode::Stor {
+        if let Some(offset) = resume_at {
+            send(&mut con.ctrl, &rest_command(offset))?;
+            let (c, m) = read_reply(&mut con.ctrl)?;
+            if c != 350 {
+                return Err(Error::BadResponse(format!("ftp REST: {c} {m}")));
+            }
         }
     }
 
@@ -266,12 +324,12 @@ pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
     let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip)?;
     let ctrl = &mut con.ctrl;
 
-    // Issue STOR, then expect the 1xx preliminary reply before streaming.
+    // Issue STOR/APPE, then expect the 1xx preliminary reply before streaming.
     send(ctrl, &cmd)?;
     let (c, m) = read_reply(ctrl)?;
     if !(c == 125 || c == 150) {
-        // A 2xx/3xx here would be unusual for STOR (data still needs sending);
-        // anything that isn't a 1xx preliminary is treated as a failure.
+        // A 2xx/3xx here would be unusual (data still needs sending); anything
+        // that isn't a 1xx preliminary is treated as a failure.
         return Err(Error::BadResponse(format!("ftp {cmd}: {c} {m}")));
     }
 
@@ -285,7 +343,10 @@ pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
     // Final completion reply (226 Transfer complete).
     let (cf, mf) = read_reply(ctrl)?;
     if !is_positive(cf) {
-        return Err(Error::BadResponse(format!("ftp STOR end: {cf} {mf}")));
+        return Err(Error::BadResponse(format!(
+            "ftp {} end: {cf} {mf}",
+            mode.verb()
+        )));
     }
 
     // Polite shutdown.
@@ -767,6 +828,42 @@ mod tests {
     }
 
     #[test]
+    fn appe_command_strips_leading_slash() {
+        // Same path handling as STOR, just a different verb.
+        assert_eq!(appe_command("/pub/file.bin").unwrap(), "APPE pub/file.bin");
+        assert_eq!(appe_command("file.bin").unwrap(), "APPE file.bin");
+        assert_eq!(appe_command("/a.txt").unwrap(), "APPE a.txt");
+    }
+
+    #[test]
+    fn appe_command_rejects_directory_path() {
+        // No filename to append to.
+        assert!(appe_command("").is_none());
+        assert!(appe_command("/").is_none());
+        assert!(appe_command("/pub/").is_none());
+    }
+
+    #[test]
+    fn appe_command_rejects_control_bytes() {
+        // The command builder itself only strips/validates the path shape;
+        // control bytes in the path are caught by `reject_ctl` on the upload
+        // path, but the assembled APPE line must never carry a raw CR/LF/NUL.
+        // `send` is the last line of defense — confirm it refuses such a line.
+        let mut io = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(Vec::new()),
+            written: Vec::new(),
+        });
+        assert!(reject_ctl("a\r\nDELE secret", "ftp path").is_err());
+        assert!(reject_ctl("a\nb", "ftp path").is_err());
+        assert!(reject_ctl("a\0b", "ftp path").is_err());
+        // And the wire guard refuses an APPE line with an embedded newline.
+        assert!(matches!(
+            send(&mut io, "APPE a\r\nDELE secret"),
+            Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
     fn rest_command_formats_offset() {
         assert_eq!(rest_command(0), "REST 0");
         assert_eq!(rest_command(1048576), "REST 1048576");
@@ -780,6 +877,19 @@ mod tests {
     fn run_store_mock(
         url: &str,
         body: &[u8],
+        resume_at: Option<u64>,
+    ) -> (Result<()>, Vec<u8>, Vec<u8>) {
+        run_upload_mock(url, body, UploadMode::Stor, resume_at)
+    }
+
+    /// Generalized version of [`run_store_mock`] that drives either `STOR` or
+    /// `APPE` (mirroring the production [`upload`] driver) over a mock control
+    /// channel plus a real loopback data socket. `resume_at` is honored only
+    /// for `STOR` (just like [`upload`]).
+    fn run_upload_mock(
+        url: &str,
+        body: &[u8],
+        mode: UploadMode,
         resume_at: Option<u64>,
     ) -> (Result<()>, Vec<u8>, Vec<u8>) {
         use std::net::{Ipv4Addr, TcpListener};
@@ -808,7 +918,8 @@ mod tests {
              230 logged in\r\n\
              200 type ok\r\n",
         );
-        if resume_at.is_some() {
+        // REST is only sent for STOR resume; APPE never negotiates an offset.
+        if mode == UploadMode::Stor && resume_at.is_some() {
             script.push_str("350 restart ok\r\n");
         }
         script.push_str(&format!(
@@ -836,13 +947,15 @@ mod tests {
                 read_reply(&mut ctrl)?;
             }
             reject_ctl(&parsed.path, "ftp path")?;
-            let cmd =
-                stor_command(&parsed.path).ok_or_else(|| Error::BadResponse("no file".into()))?;
-            if let Some(offset) = resume_at {
-                send(&mut ctrl, &rest_command(offset))?;
-                let (c, _) = read_reply(&mut ctrl)?;
-                if c != 350 {
-                    return Err(Error::BadResponse(format!("REST: {c}")));
+            let cmd = upload_command(mode, &parsed.path)
+                .ok_or_else(|| Error::BadResponse("no file".into()))?;
+            if mode == UploadMode::Stor {
+                if let Some(offset) = resume_at {
+                    send(&mut ctrl, &rest_command(offset))?;
+                    let (c, _) = read_reply(&mut ctrl)?;
+                    if c != 350 {
+                        return Err(Error::BadResponse(format!("REST: {c}")));
+                    }
                 }
             }
             let mut data = open_data(&mut ctrl, &parsed, ctrl_peer)?;
@@ -891,5 +1004,50 @@ mod tests {
         let stor_at = sent.find("STOR up.bin\r\n").expect("STOR sent");
         assert!(rest_at < stor_at, "REST must precede STOR: {sent:?}");
         assert_eq!(received, b"TAIL");
+    }
+
+    #[test]
+    fn append_streams_body_and_sends_appe() {
+        let (res, written, received) = run_upload_mock(
+            "ftp://h.example/pub/up.bin",
+            b"more data",
+            UploadMode::Appe,
+            None,
+        );
+        res.unwrap();
+        let sent = String::from_utf8(written).unwrap();
+        // APPE, not STOR, and never a REST (append negotiates no offset).
+        assert!(sent.contains("APPE pub/up.bin\r\n"), "sent: {sent:?}");
+        assert!(!sent.contains("STOR"), "must not send STOR: {sent:?}");
+        assert!(!sent.contains("REST"), "must not send REST: {sent:?}");
+        assert!(sent.contains("QUIT\r\n"));
+        assert_eq!(received, b"more data");
+    }
+
+    #[test]
+    fn append_ignores_resume_offset() {
+        // Even if a resume offset were threaded through, APPE never emits REST
+        // and streams the whole body — the public `append` always passes None,
+        // but the driver must enforce this regardless.
+        let (res, written, received) = run_upload_mock(
+            "ftp://h.example/up.bin",
+            b"WHOLE",
+            UploadMode::Appe,
+            Some(4096),
+        );
+        res.unwrap();
+        let sent = String::from_utf8(written).unwrap();
+        assert!(!sent.contains("REST"), "APPE must not send REST: {sent:?}");
+        assert!(sent.contains("APPE up.bin\r\n"), "sent: {sent:?}");
+        assert_eq!(received, b"WHOLE");
+    }
+
+    #[test]
+    fn append_rejects_non_ftp_scheme() {
+        let u = Url::parse("http://example.com/x").unwrap();
+        assert!(matches!(
+            append(&u, b"data"),
+            Err(Error::UnsupportedScheme(_))
+        ));
     }
 }
