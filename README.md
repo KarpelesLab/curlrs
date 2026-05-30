@@ -26,7 +26,7 @@ Early, in active development.
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
 | HTTP proxy (`-x`) | working | absolute-form for plain HTTP, `CONNECT` tunnel for HTTPS, Basic auth, `--noproxy` / `*_PROXY` env vars |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
-| HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; single request/conn, no flow control yet |
+| HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; connection- and stream-level flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas); one request per stream |
 | HTTP/3 over QUIC (RFC 9114) | partial | QUIC + frame layer wired; QPACK Huffman decoder still TODO |
 | FTP / FTPS (RFC 959, 4217) | working | RETR + LIST, EPSV with PASV fallback, implicit FTPS |
 | FILE (RFC 8089) | working | rejects non-local hosts |

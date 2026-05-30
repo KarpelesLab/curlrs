@@ -28,6 +28,17 @@
 //! - Frame I/O covers HEADERS, CONTINUATION, DATA, SETTINGS, PING,
 //!   WINDOW_UPDATE, GOAWAY, RST_STREAM. We auto-ACK SETTINGS, auto-PONG
 //!   PING; everything else on a non-target stream is ignored.
+//! - Flow control is fully implemented (RFC 9113 §5.2 / §6.9), at both the
+//!   connection and stream level, in each direction. On send we never emit
+//!   DATA past the smaller of the conn/stream send windows, blocking on the
+//!   peer's WINDOW_UPDATE frames when a body outruns the window, and we honour
+//!   `SETTINGS_INITIAL_WINDOW_SIZE` — including the §6.9.2 retroactive delta
+//!   applied to open streams when the peer changes it mid-connection. On
+//!   receive we bill inbound DATA against both windows and replenish the
+//!   peer's allowance with WINDOW_UPDATE as the client consumes it (tied to
+//!   actual consumption, not unconditional), while the `MAX_RESPONSE_BYTES`
+//!   cap still bounds total memory. Window overflow past 2^31-1 and
+//!   zero-increment WINDOW_UPDATEs are rejected per §6.9.1.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -4227,5 +4238,261 @@ mod tests {
             expect
         );
         assert_eq!(conn.conn_send_window.available, 65_535);
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end flow control over the I/O loop (RFC 9113 §5.2 / §6.9).
+    // These drive `send_request_on` / `process_frame` against a `FakeTls`
+    // whose `wire_in` is pre-seeded with the frames the peer would send,
+    // and inspect the bytes the `Connection` wrote to `wire_out`.
+    // -----------------------------------------------------------------
+
+    /// Build a `Connection<FakeTls>` whose inbound wire is pre-seeded with the
+    /// concatenation of `frames` (the order the peer would send them in).
+    fn fake_conn_with_inbound(frames: &[Frame]) -> Connection<FakeTls> {
+        let mut bytes = Vec::new();
+        for f in frames {
+            write_frame(&mut bytes, f).unwrap();
+        }
+        let mut conn = fake_conn();
+        conn.tls.wire_in = Cursor::new(bytes);
+        conn
+    }
+
+    /// Decode every frame the `Connection` wrote to its peer.
+    fn drain_wire_out(conn: &Connection<FakeTls>) -> Vec<Frame> {
+        let mut cur = Cursor::new(conn.tls.wire_out.clone());
+        let mut out = Vec::new();
+        while (cur.position() as usize) < conn.tls.wire_out.len() {
+            out.push(read_frame(&mut cur).unwrap());
+        }
+        out
+    }
+
+    fn h2_request_with_body(body: Vec<u8>) -> Request {
+        let mut req = Request::new("POST", "https://example.com/upload").unwrap();
+        req.body = body;
+        req
+    }
+
+    #[test]
+    fn send_body_splits_across_window_updates() {
+        // Peer advertises a tiny INITIAL_WINDOW_SIZE (5 octets). A 12-byte
+        // request body therefore cannot be sent in one go: the stream send
+        // window only allows 5 bytes, then the send loop must block until the
+        // peer grants more with WINDOW_UPDATE. We seed two stream-level
+        // WINDOW_UPDATE(+5) frames so the loop can drain the whole body across
+        // three DATA frames (5 + 5 + 2).
+        let body = (0..12u8).collect::<Vec<u8>>();
+        let req = h2_request_with_body(body.clone());
+
+        // The send loop will read these when its window hits zero.
+        let inbound = vec![window_update_frame(1, 5), window_update_frame(1, 5)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        // Shrink the peer's initial window *before* opening the stream so the
+        // new stream picks up the small send window.
+        conn.peer.initial_window_size = 5;
+
+        let id = conn.open_stream().unwrap();
+        assert_eq!(conn.streams.get(&id).unwrap().send_window.available, 5);
+
+        conn.send_request_on(id, &req).unwrap();
+
+        // Pull apart what we wrote: one or more HEADERS frames, then DATA.
+        let frames = drain_wire_out(&conn);
+        let data: Vec<&Frame> = frames.iter().filter(|f| f.typ == F_DATA).collect();
+        assert_eq!(
+            data.len(),
+            3,
+            "12-byte body under a 5-octet window must split into 5+5+2"
+        );
+        assert_eq!(data[0].payload.len(), 5);
+        assert_eq!(data[1].payload.len(), 5);
+        assert_eq!(data[2].payload.len(), 2);
+        // END_STREAM only on the final DATA frame.
+        assert_eq!(data[0].flags & FLAG_END_STREAM, 0);
+        assert_eq!(data[1].flags & FLAG_END_STREAM, 0);
+        assert_eq!(data[2].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+        // Reassembled DATA equals the original body.
+        let mut reassembled = Vec::new();
+        for d in &data {
+            reassembled.extend_from_slice(&d.payload);
+        }
+        assert_eq!(reassembled, body);
+
+        // Both windows were charged for the full body: stream window back to 0
+        // (5 + 5 granted, 12 consumed = -2... but the third chunk only fired
+        // after the second grant left 5, consuming 2 → 3 remaining).
+        let s = conn.streams.get(&id).unwrap();
+        assert_eq!(s.send_window.available, 3, "5+5 granted, 12 consumed");
+        assert_eq!(conn.conn_send_window.available, 65_535 - 12);
+    }
+
+    #[test]
+    fn send_body_blocks_on_conn_window_too() {
+        // Here the per-stream window is huge but the *connection* window is the
+        // binding constraint. Set the conn send window to 4 and seed a conn
+        // WINDOW_UPDATE(+8) on stream 0; a 10-byte body must go 4, then (after
+        // the grant) 6.
+        let body = (0..10u8).collect::<Vec<u8>>();
+        let req = h2_request_with_body(body.clone());
+
+        let inbound = vec![window_update_frame(0, 8)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        conn.conn_send_window.available = 4;
+
+        let id = conn.open_stream().unwrap();
+        conn.send_request_on(id, &req).unwrap();
+
+        let frames = drain_wire_out(&conn);
+        let data: Vec<&Frame> = frames.iter().filter(|f| f.typ == F_DATA).collect();
+        assert_eq!(data.len(), 2, "conn window of 4 then +8 splits 10 into 4+6");
+        assert_eq!(data[0].payload.len(), 4);
+        assert_eq!(data[1].payload.len(), 6);
+        assert_eq!(data[1].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+        // 4 + 8 granted = 12, consumed 10 → 2 left.
+        assert_eq!(conn.conn_send_window.available, 2);
+    }
+
+    #[test]
+    fn recv_data_replenishes_window_on_the_wire() {
+        // Drive enough inbound DATA past the half-window threshold and confirm
+        // the Connection writes WINDOW_UPDATE frames (stream + connection) back
+        // to the peer — i.e. replenishment is tied to actual consumption, not
+        // emitted unconditionally.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+
+        // A single 40_000-byte DATA frame drops both windows from 65_535 to
+        // 25_535 — below the 32_767 half-threshold — so both replenish.
+        let big = vec![0xa5u8; 40_000];
+        conn.process_frame(synth_data(id, &big, false)).unwrap();
+
+        let out = drain_wire_out(&conn);
+        let updates: Vec<&Frame> = out.iter().filter(|f| f.typ == F_WINDOW_UPDATE).collect();
+        assert_eq!(
+            updates.len(),
+            2,
+            "one conn-level and one stream-level WINDOW_UPDATE expected"
+        );
+        let conn_update = updates.iter().find(|f| f.stream_id == 0).unwrap();
+        let stream_update = updates.iter().find(|f| f.stream_id == id).unwrap();
+        // Each grant restores the consumed 40_000 octets.
+        assert_eq!(parse_window_update(&conn_update.payload).unwrap(), 40_000);
+        assert_eq!(parse_window_update(&stream_update.payload).unwrap(), 40_000);
+        // Running windows are back to full after the grant.
+        assert_eq!(conn.conn_recv_window.available, OUR_INITIAL_WINDOW);
+        assert_eq!(
+            conn.streams.get(&id).unwrap().recv_window.available,
+            OUR_INITIAL_WINDOW
+        );
+    }
+
+    #[test]
+    fn recv_small_data_does_not_replenish() {
+        // A small DATA frame that leaves both windows above the half-threshold
+        // must NOT trigger any WINDOW_UPDATE (the prior unconditional replenish
+        // was the security-audit finding this guards against).
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+
+        conn.process_frame(synth_data(id, b"hello", false)).unwrap();
+        let out = drain_wire_out(&conn);
+        assert!(
+            out.iter().all(|f| f.typ != F_WINDOW_UPDATE),
+            "no WINDOW_UPDATE should be emitted while windows stay above half"
+        );
+        assert_eq!(conn.conn_recv_window.available, OUR_INITIAL_WINDOW - 5);
+        assert_eq!(
+            conn.streams.get(&id).unwrap().recv_window.available,
+            OUR_INITIAL_WINDOW - 5
+        );
+    }
+
+    #[test]
+    fn dispatch_zero_increment_window_update_conn_is_error() {
+        // §6.9: a WINDOW_UPDATE with a 0 increment on stream 0 is a connection
+        // error. Driving it through the full dispatch ladder must surface it.
+        let mut conn = fake_conn();
+        let frame = window_update_frame(0, 0);
+        let err = conn.process_frame(frame).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn dispatch_zero_increment_window_update_stream_is_error() {
+        // §6.9: a WINDOW_UPDATE with a 0 increment on a live stream is a stream
+        // error; through the dispatch ladder it surfaces as BadResponse.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        let frame = window_update_frame(id, 0);
+        let err = conn.process_frame(frame).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn dispatch_window_update_overflow_conn_is_error() {
+        // §6.9.1: a WINDOW_UPDATE pushing the connection send window past
+        // 2^31-1 is a FLOW_CONTROL_ERROR. Prime the window near the ceiling and
+        // drive an oversized grant through dispatch.
+        let mut conn = fake_conn();
+        conn.conn_send_window.available = WINDOW_MAX - 1;
+        let err = conn.process_frame(window_update_frame(0, 5)).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn dispatch_window_update_overflow_stream_is_error() {
+        // §6.9.1 on a stream: same overflow rule via the stream dispatch path.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().send_window.available = WINDOW_MAX - 1;
+        let err = conn.process_frame(window_update_frame(id, 5)).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn settings_initial_window_change_lets_stalled_send_proceed() {
+        // A stream opened under a 0-octet initial window cannot send any body
+        // until the peer enlarges the window. Here the peer raises
+        // INITIAL_WINDOW_SIZE mid-connection (§6.9.2), which retroactively
+        // grows the existing stream's send window and unblocks the send loop.
+        let body = vec![0x11u8; 6];
+        let req = h2_request_with_body(body.clone());
+
+        // The send loop will read this SETTINGS frame when stalled at window 0;
+        // it bumps INITIAL_WINDOW_SIZE to 100, applying a +100 delta to the
+        // already-open stream. We must also seed its ACK consumption — the loop
+        // writes an ACK, which is fine (it goes to wire_out, not wire_in).
+        let settings = Frame {
+            typ: F_SETTINGS,
+            flags: 0,
+            stream_id: 0,
+            payload: settings_payload(&[(S_INITIAL_WINDOW_SIZE, 100)]),
+        };
+        let mut conn = fake_conn_with_inbound(&[settings]);
+        conn.peer.initial_window_size = 0;
+
+        let id = conn.open_stream().unwrap();
+        assert_eq!(conn.streams.get(&id).unwrap().send_window.available, 0);
+
+        conn.send_request_on(id, &req).unwrap();
+
+        let frames = drain_wire_out(&conn);
+        let data: Vec<&Frame> = frames.iter().filter(|f| f.typ == F_DATA).collect();
+        assert_eq!(data.len(), 1, "after the delta the whole body fits");
+        assert_eq!(data[0].payload, body);
+        assert_eq!(data[0].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+        // Stream send window: 0 + 100 (delta) - 6 (consumed) = 94.
+        assert_eq!(conn.streams.get(&id).unwrap().send_window.available, 94);
+        // The loop also ACKed the SETTINGS frame.
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.typ == F_SETTINGS && f.flags & FLAG_ACK != 0),
+            "SETTINGS must be ACKed"
+        );
     }
 }
