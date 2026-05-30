@@ -22,6 +22,10 @@ pub enum Error {
     /// signal so the HTTPS dispatcher can fall back to HTTP/1.1 in Auto
     /// mode; surfaced to callers only under `--http2`.
     H2NotNegotiated,
+    /// An SSH-layer failure (connect, host-key verification, authentication,
+    /// SFTP/SCP transfer). Carries a human-readable description; never the
+    /// password or key material.
+    Ssh(String),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +37,7 @@ impl fmt::Display for Error {
             Error::BadResponse(m) => write!(f, "bad response: {m}"),
             Error::UnexpectedEof => write!(f, "unexpected end of response"),
             Error::H2NotNegotiated => write!(f, "server did not select ALPN \"h2\""),
+            Error::Ssh(m) => write!(f, "ssh error: {m}"),
         }
     }
 }

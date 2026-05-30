@@ -22,7 +22,10 @@
 //!         --form-string <n=v>  like -F but the value is always literal
 //!         --form-escape        percent-encode field names/filenames per
 //!                              RFC 7578 §4.2 instead of backslash-escaping
-//!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, TFTP WRQ, or MQTT PUBLISH)
+//!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, TFTP
+//!                              WRQ, MQTT PUBLISH, or SFTP/SCP write)
+//!         --key <file>         SSH private-key identity for sftp://, scp://
+//!                              public-key auth (repeatable; curl's --key)
 //!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
 //!     -a, --append             FTP/FTPS upload: append (APPE) instead of STOR
 //!     -A, --user-agent <ua>    set User-Agent
@@ -119,6 +122,12 @@ struct Args {
     /// uploads, matching curl (whose `-a` only applies to FTP/FTPS/SFTP).
     /// `APPE` negotiates no offset, so it takes precedence over `-C`/REST.
     append: bool,
+    /// `--key <file>` — SSH private-key identity file(s) for `sftp://`/`scp://`
+    /// public-key auth (curl's `--key`). Repeatable. When empty, the default
+    /// keys under `~/.ssh` (`id_ed25519`, `id_ecdsa`, `id_rsa`) are probed.
+    /// Note: curl's `-i` is `--include` here, so the SSH identity flag is the
+    /// long form `--key` only (no `-i` alias, to avoid the collision).
+    ssh_keys: Vec<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -995,12 +1004,22 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             if parsed_url.scheme == "tftp" {
                 return run_tftp_upload(&parsed_url, path, args);
             }
+            // SFTP/SCP upload: -T <file> sftp|scp://host/remote.
+            if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
+                return run_ssh_upload(&parsed_url, path, args);
+            }
             if !args.silent {
                 eprintln!(
-                    "rsurl: -T is only supported for HTTP(S), FTP(S), and TFTP URLs in this build"
+                    "rsurl: -T is only supported for HTTP(S), FTP(S), TFTP, and SFTP/SCP URLs in this build"
                 );
             }
             return 2;
+        }
+        // SFTP/SCP download: connect, auth, fetch the remote path. Threads
+        // -u/userinfo password, --key identities, and -k into SshOptions, and
+        // emits the verbose SSH trace under -v.
+        if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
+            return run_ssh(&parsed_url, args);
         }
         return run_transfer(url, args);
     }
@@ -1243,6 +1262,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 );
             }
             "-a" | "--append" => a.append = true,
+            "--key" => a.ssh_keys.push(next_val(&mut it, arg)?),
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
@@ -1381,6 +1401,145 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     };
 
     match rsurl::tftp::store(url, &bytes) {
+        Ok(()) => 0,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
+/// Build the [`rsurl::ssh::SshOptions`] for an `sftp://`/`scp://` transfer from
+/// the parsed CLI args and URL. The password comes from the URL userinfo, else
+/// the `-u` password half; identities from `--key` (else default `~/.ssh`
+/// keys); `-k` toggles accept-any host keys. An encrypted-key passphrase reuses
+/// the `-u` password if one was given (a one-shot CLI can't prompt). Returns
+/// `(options, user)`; a missing user is a fatal usage error (curl-style code 2).
+fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, String), String> {
+    let (_, url_pass) = rsurl::ssh::userinfo_password(url);
+    // -u user:pass — the password half feeds both password auth and the
+    // encrypted-key passphrase. The user half feeds resolve_user.
+    let (cli_user, cli_pass) = match &args.basic_auth {
+        Some((u, p)) => (
+            (!u.is_empty()).then(|| u.clone()),
+            (!p.is_empty()).then(|| p.clone()),
+        ),
+        None => (None, None),
+    };
+    let password = url_pass.or(cli_pass);
+    let user = rsurl::ssh::resolve_user(url, cli_user.as_deref()).map_err(|e| e.to_string())?;
+    let opts = rsurl::ssh::SshOptions {
+        password: password.clone(),
+        identity_files: args.ssh_keys.iter().map(std::path::PathBuf::from).collect(),
+        key_passphrase: password,
+        insecure: args.insecure,
+        known_hosts_path: None,
+        timeout: args.max_time.map(Duration::from_secs),
+    };
+    Ok((opts, user))
+}
+
+/// Download an `sftp://`/`scp://` URL and write the bytes to `-o`/stdout (or
+/// `-O`). Mirrors [`run_transfer`] but threads SSH auth options and, under
+/// `-v`, prints the SSH trace to stderr. Exit codes: 0 ok, 2 usage, 7 transfer.
+fn run_ssh(url: &Url, args: &Args) -> u8 {
+    let (opts, user) = match build_ssh_options(url, args) {
+        Ok(x) => x,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            return 2;
+        }
+    };
+    let result = if args.verbose {
+        let mut err = io::stderr().lock();
+        rsurl::ssh::fetch_traced(url, &opts, &user, Some(&mut err))
+    } else {
+        rsurl::ssh::fetch(url, &opts, &user)
+    };
+    match result {
+        Ok(bytes) => {
+            let mut out: Box<dyn Write> = if args.remote_name {
+                match remote_name_from_url(url) {
+                    Ok(name) => match File::create(&name) {
+                        Ok(f) => Box::new(f),
+                        Err(e) => {
+                            if !args.silent {
+                                eprintln!("rsurl: open {name}: {e}");
+                            }
+                            return 23;
+                        }
+                    },
+                    Err(e) => {
+                        if !args.silent {
+                            eprintln!("rsurl: {e}");
+                        }
+                        return 23;
+                    }
+                }
+            } else {
+                match &args.output {
+                    Some(path) if path != "-" => match File::create(path) {
+                        Ok(f) => Box::new(f),
+                        Err(e) => {
+                            if !args.silent {
+                                eprintln!("rsurl: open {path}: {e}");
+                            }
+                            return 23;
+                        }
+                    },
+                    _ => Box::new(io::stdout().lock()),
+                }
+            };
+            if let Err(e) = out.write_all(&bytes) {
+                if !args.silent {
+                    eprintln!("rsurl: write error: {e}");
+                }
+                return 23;
+            }
+            0
+        }
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
+/// Upload a local file to an `sftp://`/`scp://` URL. Reads the whole file into
+/// memory (matching the other `-T` paths), then writes it remotely. `-v` prints
+/// the SSH trace. Exit codes: 0 ok, 2 usage, 7 transfer, 26 local-read error.
+fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: -T: can't read {path:?}: {e}");
+            }
+            return 26;
+        }
+    };
+    let (opts, user) = match build_ssh_options(url, args) {
+        Ok(x) => x,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            return 2;
+        }
+    };
+    let result = if args.verbose {
+        let mut err = io::stderr().lock();
+        rsurl::ssh::upload_traced(url, &bytes, &opts, &user, Some(&mut err))
+    } else {
+        rsurl::ssh::upload(url, &bytes, &opts, &user)
+    };
+    match result {
         Ok(()) => 0,
         Err(e) => {
             if !args.silent {
@@ -1587,7 +1746,10 @@ Options:
                            (default: backslash-escape, curl-historical)
   -T, --upload-file <f>    upload the file: HTTP PUT (default Content-Type:
                            application/octet-stream), FTP/FTPS STOR, TFTP WRQ,
-                           or MQTT PUBLISH
+                           MQTT PUBLISH, or SFTP/SCP write
+      --key <file>         SSH private-key identity file for sftp:// / scp://
+                           public-key auth (repeatable). Without it, the
+                           default ~/.ssh/id_ed25519|id_ecdsa|id_rsa are tried
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            the automatic form '-C -' is not supported
   -a, --append             FTP/FTPS upload: append (APPE) instead of replacing

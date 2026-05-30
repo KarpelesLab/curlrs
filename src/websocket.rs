@@ -994,7 +994,7 @@ mod tests {
     fn parse_16bit_length_frame() {
         // 200-byte binary payload of 0x41 ('A'), length encoded as 126 + u16.
         let mut bytes: Vec<u8> = vec![0x82, 126, 0x00, 200];
-        bytes.extend(std::iter::repeat(b'A').take(200));
+        bytes.extend(std::iter::repeat_n(b'A', 200));
         let mut cur = Cursor::new(bytes);
         let f = read_frame(&mut cur).expect("frame parses");
         assert_eq!(f.opcode, OPCODE_BINARY);

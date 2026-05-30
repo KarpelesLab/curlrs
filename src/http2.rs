@@ -149,7 +149,7 @@ impl PeerSettings {
     /// (the RFC distinguishes PROTOCOL_ERROR vs FLOW_CONTROL_ERROR, but this
     /// module doesn't surface H2 error codes yet).
     fn apply_settings_payload(&mut self, payload: &[u8]) -> Result<()> {
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             return Err(Error::BadResponse(format!(
                 "SETTINGS payload length {} not a multiple of 6",
                 payload.len()

@@ -6,7 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A pure-Rust implementation of curl, built on top of [purecrypto](https://crates.io/crates/purecrypto)
-for TLS — no OpenSSL, no system libcurl, no C dependencies.
+for TLS and [puressh](https://crates.io/crates/puressh) for SSH (SFTP/SCP) —
+no OpenSSL, no system libcurl, no C dependencies. (The SSH stack pulls only
+`libc`/`nix` on unix, which are pure-Rust FFI *bindings* — no compiled C, no
+`*-sys`/cmake/bindgen in the default build.)
 
 `rsurl` ships in three forms:
 
@@ -38,6 +41,8 @@ Early, in active development.
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
 | RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
 | TFTP (RFC 1350) | working | read (RRQ) and write/upload (`-T`, WRQ) with timeout/retry, 256 MiB cap |
+| SFTP (SSH) | working | download + upload (`-T`) over the SFTP subsystem (`open`/`read`/`write`/`close`); password (`-u`/userinfo) and public-key (`--key` or `~/.ssh/id_*`) auth; host-key verification via `~/.ssh/known_hosts` (TOFU: accept+persist unknown, reject changed; `-k` ⇒ accept-any). Via the pure-Rust `puressh` crate |
+| SCP (SSH) | working | download + upload (`-T`) driving the remote `scp -f`/`scp -t` helper, bridged through a temp file; same auth + known_hosts TOFU as SFTP. Via `puressh` |
 | WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling; permessage-deflate (RFC 7692) negotiated in the upgrade — per-message inflate/deflate with RSV1, `client/server_no_context_takeover`, inflated-size cap against compression bombs |
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
@@ -82,7 +87,20 @@ rsurl file:///etc/hostname              # local file
 rsurl dict://dict.org/d:curl            # dictionary lookup
 rsurl gopher://gopher.floodgap.com/     # gopher menu
 rsurl ftp://ftp.example.com/pub/file    # FTP download
+rsurl -u user sftp://host/path/file               # SFTP download (password auth)
+rsurl --key ~/.ssh/id_ed25519 sftp://host/f       # SFTP download (public-key auth)
+rsurl -T local.bin sftp://host/remote.bin         # SFTP upload (-T)
+rsurl -u user scp://host/etc/motd                 # SCP download
 ```
+
+SSH (`sftp://` / `scp://`) takes the user from the URL userinfo, else
+`-u`, else `$USER`. Public-key auth uses `--key <file>` (curl's `--key`;
+note `-i` stays bound to `--include` here) or, if absent, the existing
+`~/.ssh/id_ed25519` / `id_ecdsa` / `id_rsa`. Host keys are verified
+against `~/.ssh/known_hosts` with trust-on-first-use — an unknown host is
+accepted and persisted, a *changed* host key is refused — and `-k`
+downgrades to accept-any. Encrypted private keys reuse the `-u` password
+as the passphrase (there is no interactive prompt in this one-shot CLI).
 
 Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
 `-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--max-time`,
@@ -127,6 +145,9 @@ cargo build --release
 # C cdylib:     target/release/librsurl.so
 # C header:     include/rsurl.h
 ```
+
+Minimum supported Rust version (MSRV): **1.95** (raised from 1.74 when the
+`puressh`-backed SSH support landed; `puressh` requires 1.95).
 
 ### TLS backend
 

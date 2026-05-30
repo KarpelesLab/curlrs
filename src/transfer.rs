@@ -43,6 +43,19 @@ pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
         "mqtt" | "mqtts" => crate::mqtt::fetch(url),
         "pop3" | "pop3s" => crate::pop3::fetch(url),
         "rtsp" => crate::rtsp::fetch(url),
+        "sftp" | "scp" => {
+            // Library default: derive the user from the URL/`$USER`, take any
+            // password from the URL userinfo, and use TOFU known_hosts (no
+            // `-k`). The CLI calls `ssh::fetch_traced` directly so it can also
+            // thread `-u`, `--key`, and `-k`.
+            let user = crate::ssh::resolve_user(url, None)?;
+            let (_, password) = crate::ssh::userinfo_password(url);
+            let opts = crate::ssh::SshOptions {
+                password,
+                ..Default::default()
+            };
+            crate::ssh::fetch(url, &opts, &user)
+        }
         "tftp" => crate::tftp::fetch(url),
         "ws" | "wss" => crate::websocket::fetch(url),
         other => Err(Error::UnsupportedScheme(other.to_string())),

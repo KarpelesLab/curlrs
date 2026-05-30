@@ -29,6 +29,7 @@ pub mod ldap;
 pub mod mqtt;
 pub mod pop3;
 pub mod rtsp;
+pub mod ssh;
 pub mod tftp;
 pub mod websocket;
 

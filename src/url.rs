@@ -240,6 +240,7 @@ fn default_port(scheme: &str) -> Option<u16> {
         "pop3s" => 995,
         "rtsp" => 554,
         "tftp" => 69,
+        "sftp" | "scp" => 22,
         _ => return None,
     })
 }
@@ -299,7 +300,7 @@ mod tests {
     fn default_ports_cover_all_protocols() {
         for scheme in [
             "http", "https", "ftp", "ftps", "dict", "gopher", "gophers", "imap", "imaps", "ldap",
-            "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "tftp", "ws", "wss",
+            "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "tftp", "ws", "wss", "sftp", "scp",
         ] {
             let url = format!("{scheme}://example.com");
             let u = Url::parse(&url).unwrap_or_else(|e| panic!("scheme {scheme}: {e}"));

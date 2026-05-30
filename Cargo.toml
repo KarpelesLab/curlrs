@@ -2,7 +2,7 @@
 name = "rsurl"
 version = "0.0.2"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.95"
 authors = ["Karpelès Lab Inc."]
 description = "A pure-Rust implementation of curl. Library, C FFI, and CLI for HTTP/HTTPS/FTP/FTPS."
 license = "MIT"
@@ -50,6 +50,17 @@ rustls-pemfile = { version = "2", optional = true }
 # `lzw` is the Unix `compress(1)` / `.Z` format. `factory` and `rle` are not
 # needed here, so leave default features off and opt in to only what we use.
 compcol = { version = "0.4", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw"] }
+# Pure-Rust SSH stack (same lab, built on purecrypto) behind the `sftp://` and
+# `scp://` schemes. Default-on, not feature-gated. We take only the `client`
+# feature (implies `std`; exposes `client`, `sftp`, `scp`, `known_hosts`, `key`)
+# plus `compress` (zlib@openssh.com). We deliberately do NOT enable `server`,
+# `multichannel`, `ffi`, or — critically — `pam`: the `pam` feature pulls
+# `pam-client2`, a C/FFI crate that would break the no-C-toolchain guarantee.
+# On unix, puressh unconditionally depends on `libc`/`nix`, but those are
+# pure-Rust FFI *binding* crates (extern decls against the libc that std
+# already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
+# so the default purecrypto build stays free of any compiled-C dependency.
+puressh = { version = "0.0.3", default-features = false, features = ["client", "compress"] }
 
 [profile.release]
 lto = "thin"
