@@ -39,6 +39,8 @@
 //!         --connect-timeout    cap on the TCP connect step
 //!         --http2              require HTTP/2 (ALPN h2); error if unavailable
 //!         --http1.1            force HTTP/1.1 (alias: --http1)
+//!         --http3              try HTTP/3 (QUIC), fall back to h2/1.1
+//!         --http3-only         require HTTP/3 (QUIC); no fallback
 //!     -b, --cookie <data>      cookies: "k=v[; k=v]" or a Netscape file path
 //!     -c, --cookie-jar <file>  write all known cookies to <file> on exit
 //!     -x, --proxy <url>        outbound HTTP proxy (e.g. http://host:port)
@@ -74,7 +76,8 @@ struct Args {
     data_parts: Vec<DataPart>,
     user_agent: Option<String>,
     referer: Option<String>,
-    /// Most recent HTTP version flag (--http2, --http1.1) seen on the CLI.
+    /// Most recent HTTP version flag (--http2, --http1.1, --http3,
+    /// --http3-only) seen on the CLI.
     /// `None` means "Auto" — the library decides via ALPN. Last one wins,
     /// matching curl.
     http_version: Option<HttpVersionPref>,
@@ -1079,6 +1082,8 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     match args.http_version {
         Some(HttpVersionPref::Http2Only) => req = req.http2_only(),
         Some(HttpVersionPref::Http11Only) => req = req.http11_only(),
+        Some(HttpVersionPref::Http3) => req = req.http3(),
+        Some(HttpVersionPref::Http3Only) => req = req.http3_only(),
         Some(HttpVersionPref::Auto) | None => {}
     }
 
@@ -1268,6 +1273,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
             // curl also accepts `--http1` as a shorthand for `--http1.1`.
             "--http1.1" | "--http1" => a.http_version = Some(HttpVersionPref::Http11Only),
+            "--http3" => a.http_version = Some(HttpVersionPref::Http3),
+            "--http3-only" => a.http_version = Some(HttpVersionPref::Http3Only),
             "-L" | "--location" => a.follow_redirects = true,
             "--max-redirs" => {
                 let v = next_val(&mut it, arg)?;
@@ -1766,6 +1773,8 @@ Options:
                            cap on the TCP connect step
       --http2              require HTTP/2 (ALPN h2); error if unavailable
       --http1.1            force HTTP/1.1 (alias: --http1)
+      --http3              try HTTP/3 (QUIC), fall back to HTTP/2/1.1
+      --http3-only         require HTTP/3 (QUIC); no fallback
   -b, --cookie <data>      cookies to send: \"k=v[; k2=v2]\" or path to a
                            Netscape cookies.txt file
   -c, --cookie-jar <file>  write all known cookies to <file> on exit

@@ -1386,3 +1386,65 @@ fn cli_custom_content_type_header_overrides_default() {
     );
     assert_eq!(got.2, br#"{"k":"v"}"#);
 }
+
+/// `--http3-only` against an unresolvable host must fail cleanly: a non-zero
+/// transfer exit (7), no panic, and no fallback to TCP. We use an `.invalid`
+/// host (RFC 6761 guarantees it never resolves) so the QUIC path bails at the
+/// UDP-address-resolution step on every platform — no UDP egress required, so
+/// the test is hermetic and deterministic in CI.
+#[test]
+fn cli_http3_only_unresolvable_fails_cleanly() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--http3-only", "https://host.invalid/"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(7),
+        "expected transfer error exit 7, got {code:?}"
+    );
+    // It must not have crashed (a panic yields no exit code on unix, or a
+    // SIGABRT/SIGSEGV-derived code), and the error must be a clean message.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
+}
+
+/// `--http3-only` on a plaintext `http://` URL is a hard error — HTTP/3 needs
+/// QUIC, which is encrypted by construction. Exit non-zero, no panic.
+#[test]
+fn cli_http3_only_rejects_plaintext_http() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--http3-only", "http://host.invalid/"])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        !out.status.success(),
+        "http:// + --http3-only must fail, got {:?}",
+        out.status
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
+}
+
+/// `--http3` (with fallback) against an unresolvable host fails cleanly too:
+/// the QUIC attempt can't resolve, falls through to the Auto h2/1.1 path, and
+/// that also can't resolve — so the whole thing exits 7 without panicking.
+#[test]
+fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--http3", "https://host.invalid/"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(7),
+        "expected transfer error exit 7, got {code:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
+}

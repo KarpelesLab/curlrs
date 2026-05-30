@@ -12,6 +12,7 @@ pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// Preference for which HTTP version to use over HTTPS. The HTTPS dispatcher
 /// picks this up. HTTP/2 is selected via ALPN at TLS-handshake time; if the
 /// server doesn't agree (Auto) we transparently fall back to HTTP/1.1.
+/// HTTP/3 runs over a wholly separate QUIC/UDP path (see [`crate::http3`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HttpVersionPref {
     /// Offer ALPN `["h2", "http/1.1"]` and let the server pick. If h2 is
@@ -23,6 +24,15 @@ pub enum HttpVersionPref {
     /// Require HTTP/2; abort the request if the server doesn't select it.
     /// Matches `curl --http2-prior-knowledge` semantics.
     Http2Only,
+    /// Attempt HTTP/3 over QUIC first; on a transport-level failure (UDP
+    /// blocked, QUIC handshake/negotiation failure, timeout) fall back to
+    /// the [`Self::Auto`] path (HTTP/2, then HTTP/1.1). Matches `curl
+    /// --http3`. A real HTTP response — even a 4xx/5xx — does *not* trigger
+    /// fallback.
+    Http3,
+    /// Require HTTP/3 over QUIC; abort the request if QUIC can't be
+    /// established. No fallback. Matches `curl --http3-only`.
+    Http3Only,
 }
 
 /// An HTTP request being constructed.
@@ -173,6 +183,21 @@ impl Request {
     /// Force HTTP/1.1; ALPN is not offered. Equivalent to `curl --http1.1`.
     pub fn http11_only(mut self) -> Self {
         self.http_version_pref = HttpVersionPref::Http11Only;
+        self
+    }
+
+    /// Attempt HTTP/3 over QUIC, falling back to HTTP/2/HTTP/1.1 on a
+    /// transport-level failure. Equivalent to `curl --http3` for an
+    /// `https://` URL. Has no effect on plaintext `http://` requests.
+    pub fn http3(mut self) -> Self {
+        self.http_version_pref = HttpVersionPref::Http3;
+        self
+    }
+
+    /// Force HTTP/3 over QUIC; the request fails if a QUIC connection can't
+    /// be established. No fallback. Equivalent to `curl --http3-only`.
+    pub fn http3_only(mut self) -> Self {
+        self.http_version_pref = HttpVersionPref::Http3Only;
         self
     }
 
@@ -441,6 +466,24 @@ impl Response {
 }
 
 fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    // HTTP/3 runs only over QUIC, which is encrypted by construction, so it
+    // has no meaning for a plaintext `http://` URL. `--http3-only` is a hard
+    // requirement and must fail; `--http3` is a preference, so we just note it
+    // and proceed over HTTP/1.1.
+    match req.http_version_pref {
+        HttpVersionPref::Http3Only => {
+            return Err(Error::UnsupportedScheme(
+                "http/3 requires https://, not http://".into(),
+            ));
+        }
+        HttpVersionPref::Http3 => {
+            let _ = writeln!(
+                trace,
+                "* HTTP/3 requested but URL is http://; using HTTP/1.1 (h3 needs https)"
+            );
+        }
+        _ => {}
+    }
     // Pool reuse is only safe for direct connections. Via-proxy we'd be
     // sharing one socket across many origins via absolute-form lines, which
     // works on paper but mixes badly with `Proxy-Authorization:` per-origin
@@ -675,6 +718,47 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
     Ok(opts)
 }
 
+/// Decide whether an error from the HTTP/3 (QUIC) path should trigger a
+/// fallback to HTTP/2/HTTP/1.1 under `--http3`.
+///
+/// Transport-level failures — UDP egress blocked, the QUIC handshake never
+/// completing, version negotiation, timeouts, a connection torn down before a
+/// response — mean HTTP/3 simply isn't usable here, so we retry over TCP.
+/// Anything else (a malformed-but-real response decoded over an established
+/// QUIC connection) is propagated: the server *was* reached over h3, so
+/// silently re-issuing over h2 could mask a genuine protocol bug. Note that a
+/// real HTTP response with a 4xx/5xx status is `Ok(Response)`, not an error,
+/// and never reaches this function.
+pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
+    match e {
+        // I/O = UDP socket / connect / timeout failures.
+        Error::Io(_) => true,
+        // `http3::send` rejects non-`https://` URLs and unresolvable hosts up
+        // front; those are configuration issues we can retry over TCP.
+        Error::UnsupportedScheme(_) | Error::InvalidUrl(_) => true,
+        // The QUIC/HTTP3 layer tags its own connection-establishment errors
+        // with an `http3:` prefix. Treat the handshake/connection ones as
+        // transport failures; leave mid-response decode failures to propagate.
+        Error::BadResponse(m) => {
+            m.starts_with("http3: connection closed")
+                || m.starts_with("http3: peer closed")
+                || m.starts_with("http3: build client")
+                || m.starts_with("http3: open_bidi")
+                || m.starts_with("http3: open_uni")
+                // `feed` is the QUIC datagram-ingest step: a decode failure here
+                // means we couldn't parse the peer's packets (version/transport
+                // mismatch), i.e. QUIC never came up — a transport failure.
+                || m.starts_with("http3: feed")
+                // stream read/write errors before any response bytes arrived are
+                // likewise a torn-down connection, not a real HTTP response.
+                || m.starts_with("http3: stream read")
+                || m.starts_with("http3: stream write")
+                || m.starts_with("http3: stream finish")
+        }
+        _ => false,
+    }
+}
+
 fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // HTTP version routing:
     //
@@ -686,12 +770,39 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     //   This is the same behaviour curl gives you by default — h2 if both
     //   ends support it, http/1.1 otherwise.
     // * `Http11Only`: skip h2 entirely and do not offer ALPN.
+    // * `Http3Only` / `Http3`: dispatched on the separate QUIC/UDP path
+    //   (`crate::http3::send`) before any TCP work. `Http3Only` returns the
+    //   result verbatim; `Http3` falls back to the `Auto` path on a
+    //   transport failure.
+    // HTTP/3 is attempted first when requested. `Http3Only` returns whatever
+    // the QUIC path produces. `Http3` returns a success or a non-transport
+    // error verbatim, but on a transport failure it falls through to the
+    // `Auto` h2/http1.1 logic below.
+    match req.http_version_pref {
+        HttpVersionPref::Http3Only => {
+            let _ = writeln!(trace, "* Trying HTTP/3 (QUIC), required (--http3-only)");
+            return crate::http3::send(req, trace);
+        }
+        HttpVersionPref::Http3 => {
+            let _ = writeln!(trace, "* Trying HTTP/3 (QUIC)...");
+            match crate::http3::send(req.clone(), trace) {
+                Ok(resp) => return Ok(resp),
+                Err(e) if h3_should_fall_back(&e) => {
+                    let _ = writeln!(trace, "* HTTP/3 failed ({e}), falling back to HTTP/2/1.1");
+                    // Fall through to the Auto path (h2, then http/1.1).
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        _ => {}
+    }
+
     match req.http_version_pref {
         HttpVersionPref::Http2Only => {
             let _ = writeln!(trace, "* HTTP/2 required (--http2)");
             return crate::http2::send(req, trace);
         }
-        HttpVersionPref::Auto => {
+        HttpVersionPref::Auto | HttpVersionPref::Http3 => {
             let _ = writeln!(trace, "* Trying HTTP/2 via ALPN (h2)");
             match crate::http2::send(req.clone(), trace) {
                 Ok(resp) => return Ok(resp),
@@ -707,9 +818,12 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
         HttpVersionPref::Http11Only => {
             let _ = writeln!(trace, "* HTTP/1.1 forced (--http1.1)");
         }
+        // `Http3Only` always returns from the first match above; it can never
+        // reach this point.
+        HttpVersionPref::Http3Only => unreachable!("Http3Only handled above"),
     }
 
-    // HTTP/1.1 path (Auto fallback or Http11Only). ALPN is not offered so
+    // HTTP/1.1 path (Auto fallback, Http3 fallback, or Http11Only). ALPN is not offered so
     // the cert-only handshake doesn't change behaviour for h2-only servers
     // (those would have been satisfied by the h2 attempt above).
     let direct = req.proxy.is_none() || proxy_bypassed(&req);
@@ -1493,6 +1607,53 @@ mod tests {
         let mut trace = Vec::new();
         assert!(write_request(&mut sink, &req, false, &mut trace).is_err());
         assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn http3_builder_methods_set_pref() {
+        let r = Request::get("https://example.com/").unwrap().http3();
+        assert_eq!(r.http_version_pref, HttpVersionPref::Http3);
+        let r = Request::get("https://example.com/").unwrap().http3_only();
+        assert_eq!(r.http_version_pref, HttpVersionPref::Http3Only);
+        // http_version(pref) covers the new variants too.
+        let r = Request::get("https://example.com/")
+            .unwrap()
+            .http_version(HttpVersionPref::Http3);
+        assert_eq!(r.http_version_pref, HttpVersionPref::Http3);
+    }
+
+    #[test]
+    fn h3_fallback_classification() {
+        use std::io;
+        // Transport failures fall back under --http3.
+        assert!(h3_should_fall_back(&Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "x"
+        ))));
+        assert!(h3_should_fall_back(&Error::BadResponse(
+            "http3: feed: Decode".into()
+        )));
+        assert!(h3_should_fall_back(&Error::BadResponse(
+            "http3: connection closed mid-handshake".into()
+        )));
+        assert!(h3_should_fall_back(&Error::BadResponse(
+            "http3: peer closed connection".into()
+        )));
+        // A mid-response protocol/decode error over an established QUIC
+        // connection is propagated, not silently retried over TCP.
+        assert!(!h3_should_fall_back(&Error::BadResponse(
+            "qpack: dynamic index out of range".into()
+        )));
+        assert!(!h3_should_fall_back(&Error::H2NotNegotiated));
+    }
+
+    #[test]
+    fn http3_only_over_plaintext_http_errors() {
+        // --http3-only on an http:// URL must fail clearly (h3 needs TLS/QUIC).
+        let req = Request::get("http://example.com/").unwrap().http3_only();
+        let mut trace = Vec::new();
+        let err = send_plain(req, &mut trace).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedScheme(_)));
     }
 
     #[test]
