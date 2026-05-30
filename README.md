@@ -36,7 +36,7 @@ Early, in active development.
 | LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; subset of filter syntax |
 | MQTT / MQTTS (v3.1.1) | working | CONNECT, SUBSCRIBE, receive one PUBLISH (QoS 0) |
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
-| RTSP (RFC 7826) | working | DESCRIBE only; SETUP/PLAY session flow deferred |
+| RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
 | TFTP (RFC 1350) | working | read (RRQ) and write/upload (`-T`, WRQ) with timeout/retry, 256 MiB cap |
 | WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling |
 

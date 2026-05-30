@@ -8,7 +8,8 @@
 //!     -I, --head               issue HEAD instead of GET
 //!     -v, --verbose            print request/response headers to stderr
 //!     -s, --silent             suppress error messages
-//!     -X, --request <method>   override HTTP method
+//!     -X, --request <method>   override HTTP method; for rtsp:// selects the
+//!                              RTSP method (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN)
 //!     -H, --header <line>      add a request header (repeatable)
 //!     -d, --data <body>        POST body (urlencoded); @file reads from disk
 //!         --data-raw <body>    like -d but no @file interpretation
@@ -964,6 +965,11 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
     if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
+        // RTSP honours `-X`/`--request` to select the control method
+        // (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN); default is DESCRIBE.
+        if parsed_url.scheme == "rtsp" {
+            return run_rtsp(&parsed_url, args);
+        }
         if let Some(path) = &args.upload_file {
             // FTP/FTPS upload: -T <file> ftp://host/remote → STOR (with REST
             // resume when -C <offset> is given). Other non-HTTP schemes don't
@@ -1360,6 +1366,45 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     }
 }
 
+/// Drive an RTSP control-channel session. `-X`/`--request` selects the method
+/// (default `DESCRIBE`). `OPTIONS`/`DESCRIBE` are single requests; selecting
+/// `SETUP`/`PLAY`/`TEARDOWN` runs the full handshake on one connection
+/// (`OPTIONS` → `DESCRIBE` → `SETUP` → ...) since a one-shot CLI process can't
+/// carry session state between invocations — see [`rsurl::rtsp::run_method`].
+/// The named method's response body is written like any other transfer.
+fn run_rtsp(url: &Url, args: &Args) -> u8 {
+    let method = args.method.as_deref().unwrap_or("DESCRIBE");
+    match rsurl::rtsp::run_method(url, method) {
+        Ok(bytes) => {
+            let mut out: Box<dyn Write> = match &args.output {
+                Some(path) if path != "-" => match File::create(path) {
+                    Ok(f) => Box::new(f),
+                    Err(e) => {
+                        if !args.silent {
+                            eprintln!("rsurl: open {path}: {e}");
+                        }
+                        return 23;
+                    }
+                },
+                _ => Box::new(io::stdout().lock()),
+            };
+            if let Err(e) = out.write_all(&bytes) {
+                if !args.silent {
+                    eprintln!("rsurl: write error: {e}");
+                }
+                return 23;
+            }
+            0
+        }
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
 fn run_transfer(url: &str, args: &Args) -> u8 {
     match rsurl::transfer(url) {
         Ok(bytes) => {
@@ -1451,7 +1496,8 @@ Options:
   -I, --head               issue HEAD instead of GET
   -v, --verbose            print request/response headers to stderr
   -s, --silent             suppress error messages
-  -X, --request <method>   override HTTP method
+  -X, --request <method>   override HTTP method; for rtsp:// selects the
+                           RTSP method (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN)
   -H, --header <line>      add a request header (repeatable)
   -d, --data <body>        POST body (urlencoded); @file reads from disk
                            and strips CR/LF. Repeatable; joined with '&'.
