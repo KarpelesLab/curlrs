@@ -184,18 +184,24 @@ fn discover_default_keys(ssh_dir: &Path) -> Vec<PathBuf> {
 
 /// Build the host-key policy `Config` for this connection. `-k` ⇒ accept-any;
 /// otherwise TOFU against known_hosts (accept+persist unknown, reject changed).
-fn build_config(opts: &SshOptions) -> Config {
+fn build_config(opts: &SshOptions) -> Result<Config> {
     if opts.insecure {
-        return Config {
+        return Ok(Config {
             host_key_policy: HostKeyPolicy::AcceptAny,
             timeout: opts.timeout,
-        };
+        });
     }
     let kh_path = opts.known_hosts_path.clone().or_else(default_known_hosts);
     // Load the existing store if present; start empty otherwise (a fresh
-    // known_hosts the first TOFU accept will create).
+    // known_hosts the first TOFU accept will create). `KnownHosts::load` maps a
+    // missing file to `Ok(empty)`, so an `Err` here means the file EXISTS but is
+    // genuinely unreadable (EACCES, EIO, a directory in its place, ...). Fail
+    // closed in that case instead of degrading to an empty accept-all store —
+    // otherwise a populated, pinned known_hosts would silently become TOFU
+    // accept-all and persist the new key, defeating host-key pinning.
     let store = match &kh_path {
-        Some(p) => KnownHosts::load(p).unwrap_or_else(|_| KnownHosts::new()),
+        Some(p) => KnownHosts::load(p)
+            .map_err(|e| Error::Ssh(format!("reading known_hosts {}: {e}", p.display())))?,
         None => KnownHosts::new(),
     };
     let policy = KnownHostsPolicy {
@@ -205,10 +211,10 @@ fn build_config(opts: &SshOptions) -> Config {
         on_unknown: TofuAction::Accept,
         on_mismatch: TofuAction::Reject,
     };
-    Config {
+    Ok(Config {
         host_key_policy: HostKeyPolicy::KnownHosts(policy),
         timeout: opts.timeout,
-    }
+    })
 }
 
 /// Load one identity file into a `ClientCredential::PublicKey`. Encrypted keys
@@ -275,7 +281,7 @@ fn connect_auth(
     if let Some(t) = trace.as_mut() {
         let _ = writeln!(t, "* Trying {}:{}...", url.host, url.port);
     }
-    let cfg = build_config(opts);
+    let cfg = build_config(opts)?;
     let mut client = Client::connect_to_host(&url.host, url.port, cfg).map_err(ssh_err)?;
     if let Some(t) = trace.as_mut() {
         let _ = writeln!(t, "* SSH connected to {}:{}", url.host, url.port);
@@ -611,7 +617,7 @@ mod tests {
             insecure: true,
             ..Default::default()
         };
-        let cfg = build_config(&opts);
+        let cfg = build_config(&opts).expect("insecure config builds");
         assert!(matches!(cfg.host_key_policy, HostKeyPolicy::AcceptAny));
     }
 
@@ -622,7 +628,7 @@ mod tests {
             known_hosts_path: Some(std::env::temp_dir().join("rsurl-kh-nonexistent")),
             ..Default::default()
         };
-        let cfg = build_config(&opts);
+        let cfg = build_config(&opts).expect("tofu config builds for a missing known_hosts");
         match cfg.host_key_policy {
             HostKeyPolicy::KnownHosts(p) => {
                 assert!(matches!(p.on_unknown, TofuAction::Accept));
@@ -631,6 +637,27 @@ mod tests {
             }
             _ => panic!("expected KnownHosts policy"),
         }
+    }
+
+    #[test]
+    fn build_config_fails_closed_on_unreadable_known_hosts() {
+        // A known_hosts path that exists but cannot be read as a file (here a
+        // directory standing in its place) yields a genuine I/O error from
+        // `KnownHosts::load`. We must propagate it rather than silently fall back
+        // to an empty accept-all store, which would defeat host-key pinning.
+        let dir = std::env::temp_dir().join("rsurl-kh-dir-as-file");
+        std::fs::create_dir_all(&dir).expect("create stand-in directory");
+        let opts = SshOptions {
+            insecure: false,
+            known_hosts_path: Some(dir.clone()),
+            ..Default::default()
+        };
+        let is_fail_closed = matches!(build_config(&opts), Err(Error::Ssh(_)));
+        let _ = std::fs::remove_dir(&dir);
+        assert!(
+            is_fail_closed,
+            "expected fail-closed Error::Ssh for an unreadable known_hosts"
+        );
     }
 
     #[test]
