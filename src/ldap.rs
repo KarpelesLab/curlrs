@@ -10,8 +10,9 @@
 //!
 //! Scope of this module: a single Bind + Search + Unbind round-trip. The
 //! filter parser handles `(attr=value)` (equality), `(attr=*)` (present),
-//! substrings (`(cn=foo*bar*baz)`, RFC 4511 §4.5.1), and boolean combinations
-//! `(&...)`, `(|...)`, `(!...)`. Extensible match is not implemented.
+//! substrings (`(cn=foo*bar*baz)`, RFC 4511 §4.5.1), extensible match
+//! (`(attr:rule:=value)`, RFC 4515 §3), and boolean combinations
+//! `(&...)`, `(|...)`, `(!...)`.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -405,6 +406,17 @@ enum Filter {
         final_: Option<String>,
     },
     Present(String),
+    /// RFC 4511 §4.5.1 extensibleMatch / RFC 4515 §3 string form
+    /// `(attr:dn:rule:=value)`. `matching_rule` is the optional `[1]`
+    /// MatchingRuleId (OID or name), `attr_type` the optional `[2]`
+    /// AttributeDescription, `match_value` the required `[3]` AssertionValue,
+    /// and `dn_attributes` the `[4]` BOOLEAN (only emitted when TRUE).
+    ExtensibleMatch {
+        matching_rule: Option<String>,
+        attr_type: Option<String>,
+        match_value: String,
+        dn_attributes: bool,
+    },
 }
 
 struct FilterParser<'a> {
@@ -481,14 +493,18 @@ impl<'a> FilterParser<'a> {
     }
 
     fn parse_simple(&mut self) -> Result<Filter> {
-        // Read attribute name up to '=' (no other operators supported).
+        // Read the description part up to '=' (the value separator). We allow
+        // ':' here because the extensible-match form `(attr:dn:rule:=value)`
+        // embeds colons before its `:=` operator; `~=`, `>=`, `<=` are still
+        // unsupported.
         let start = self.pos;
         while let Some(c) = self.peek() {
             if c == b'=' || c == b')' {
                 break;
             }
-            // Reject substring/extensible-match operator prefixes for now.
-            if c == b'~' || c == b'<' || c == b'>' || c == b':' {
+            // `~=`, `>=`, `<=` aren't supported. A leading `:` (and the colons
+            // inside an extensible match) are fine and handled below.
+            if c == b'~' || c == b'<' || c == b'>' {
                 return Err(Error::BadResponse(format!(
                     "filter: operator {:?} not supported",
                     c as char
@@ -496,21 +512,19 @@ impl<'a> FilterParser<'a> {
             }
             self.bump();
         }
-        let attr = std::str::from_utf8(&self.bytes[start..self.pos])
+        let desc = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| Error::BadResponse("filter: non-utf8 attr".into()))?
             .to_string();
         self.expect(b'=')?;
-        // Read value up to ')'.
-        let vstart = self.pos;
-        while let Some(c) = self.peek() {
-            if c == b')' {
-                break;
-            }
-            self.bump();
+        // Extensible match: the description ends with a `:` (forming the `:=`
+        // operator) or contains `:` at all. RFC 4515 §3 string forms:
+        //   attr:=value  attr:dn:=value  attr:rule:=value  attr:dn:rule:=value
+        //   :rule:=value  :dn:rule:=value
+        if desc.contains(':') {
+            return self.parse_extensible(&desc);
         }
-        let value_raw = std::str::from_utf8(&self.bytes[vstart..self.pos])
-            .map_err(|_| Error::BadResponse("filter: non-utf8 value".into()))?
-            .to_string();
+        let attr = desc;
+        let value_raw = self.read_value()?;
         // A bare `*` is the presence filter, NOT a substring match.
         if value_raw == "*" {
             return Ok(Filter::Present(attr));
@@ -552,6 +566,114 @@ impl<'a> FilterParser<'a> {
         Ok(Filter::EqualityMatch {
             attr,
             value: value_raw,
+        })
+    }
+
+    /// Read an assertion value up to the closing `)`.
+    fn read_value(&mut self) -> Result<String> {
+        let vstart = self.pos;
+        while let Some(c) = self.peek() {
+            if c == b')' {
+                break;
+            }
+            self.bump();
+        }
+        std::str::from_utf8(&self.bytes[vstart..self.pos])
+            .map_err(|_| Error::BadResponse("filter: non-utf8 value".into()))
+            .map(|s| s.to_string())
+    }
+
+    /// Parse the extensible-match form (RFC 4515 §3). `desc` is the text before
+    /// the `=` of the `:=` operator — i.e. everything up to and including the
+    /// final `:`. The caller has already consumed the `=`; this reads the value.
+    ///
+    /// `desc` always ends with the operator's `:` and is split on `:`:
+    ///   `cn:`            -> ["cn", ""]            attr only
+    ///   `cn:dn:`         -> ["cn", "dn", ""]      attr + dn
+    ///   `cn:rule:`       -> ["cn", "rule", ""]    attr + matchingRule
+    ///   `cn:dn:rule:`    -> ["cn", "dn", "rule", ""]
+    ///   `:rule:`         -> ["", "rule", ""]      no attr, matchingRule
+    ///   `:dn:rule:`      -> ["", "dn", "rule", ""]
+    /// The first token is the attribute description (empty => none). The final
+    /// token is the empty string left of the `:=`. Interior tokens are the
+    /// optional `dn` marker and/or the matchingRule, in either supported order.
+    fn parse_extensible(&mut self, desc: &str) -> Result<Filter> {
+        let mut tokens: Vec<&str> = desc.split(':').collect();
+        // The last token is the empty string immediately before `:=`.
+        match tokens.last() {
+            Some(&"") => {
+                tokens.pop();
+            }
+            _ => {
+                // `desc` came from text ending at the `=`; the operator is `:=`
+                // so the final segment must be empty. Anything else (e.g. a `:`
+                // in the middle of an attribute, which RFC 4515 disallows) is a
+                // malformed filter.
+                return Err(Error::BadResponse(
+                    "filter: malformed extensible match (expected ':=')".into(),
+                ));
+            }
+        }
+        if tokens.is_empty() {
+            return Err(Error::BadResponse(
+                "filter: empty extensible match description".into(),
+            ));
+        }
+        // First token is the attribute type (may be empty => no type).
+        let attr_type = {
+            let a = tokens.remove(0);
+            if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            }
+        };
+        // Remaining tokens: an optional `dn` marker and an optional matchingRule.
+        let mut dn_attributes = false;
+        let mut matching_rule: Option<String> = None;
+        for tok in tokens {
+            if tok == "dn" {
+                if dn_attributes {
+                    return Err(Error::BadResponse(
+                        "filter: duplicate 'dn' in extensible match".into(),
+                    ));
+                }
+                dn_attributes = true;
+            } else if tok.is_empty() {
+                return Err(Error::BadResponse(
+                    "filter: empty token in extensible match".into(),
+                ));
+            } else if matching_rule.is_some() {
+                return Err(Error::BadResponse(
+                    "filter: multiple matching rules in extensible match".into(),
+                ));
+            } else {
+                matching_rule = Some(tok.to_string());
+            }
+        }
+        // An extensible match must constrain on something: a type, a rule, or
+        // both. `(:dn:=value)` (dn only, no type and no rule) is meaningless.
+        if attr_type.is_none() && matching_rule.is_none() {
+            return Err(Error::BadResponse(
+                "filter: extensible match needs an attribute or matching rule".into(),
+            ));
+        }
+        let match_value = self.read_value()?;
+        // Every field is BER-encoded into the request; reject embedded control
+        // bytes the same as every other filter field. (Like equality, no RFC
+        // 4515 de-escaping is performed.)
+        reject_ctl(&match_value, "filter extensible match value")?;
+        if let Some(t) = &attr_type {
+            reject_ctl(t, "filter extensible match attribute")?;
+        }
+        if let Some(r) = &matching_rule {
+            reject_ctl(r, "filter extensible match rule")?;
+        }
+        Ok(Filter::ExtensibleMatch {
+            matching_rule,
+            attr_type,
+            match_value,
+            dn_attributes,
         })
     }
 }
@@ -628,6 +750,37 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
         Filter::Present(attr) => {
             // [7] AttributeDescription -- primitive octet string
             write_tlv(out, tag::ctx(7, false), attr.as_bytes());
+        }
+        Filter::ExtensibleMatch {
+            matching_rule,
+            attr_type,
+            match_value,
+            dn_attributes,
+        } => {
+            // [9] MatchingRuleAssertion ::= SEQUENCE {
+            //   matchingRule [1] MatchingRuleId OPTIONAL,
+            //   type         [2] AttributeDescription OPTIONAL,
+            //   matchValue   [3] AssertionValue,
+            //   dnAttributes [4] BOOLEAN DEFAULT FALSE }
+            // The outer tag is context [9] constructed (0xA9); the children are
+            // primitive context strings in field order. dnAttributes is only
+            // emitted when TRUE (DEFAULT FALSE is omitted).
+            write_constructed(out, tag::ctx(9, true), |w| {
+                if let Some(rule) = matching_rule {
+                    // matchingRule [1] -- primitive octet string
+                    write_tlv(w, tag::ctx(1, false), rule.as_bytes());
+                }
+                if let Some(t) = attr_type {
+                    // type [2] -- primitive octet string
+                    write_tlv(w, tag::ctx(2, false), t.as_bytes());
+                }
+                // matchValue [3] -- primitive octet string (REQUIRED)
+                write_tlv(w, tag::ctx(3, false), match_value.as_bytes());
+                if *dn_attributes {
+                    // dnAttributes [4] -- BOOLEAN, single 0xFF byte
+                    write_tlv(w, tag::ctx(4, false), &[0xff]);
+                }
+            });
         }
     }
 }
@@ -1406,6 +1559,224 @@ mod tests {
         let buf = encode_one(&f);
         assert_eq!(buf[0], 0xA3);
         assert_eq!(buf[0], tag::ctx(3, true));
+    }
+
+    #[test]
+    fn parse_filter_extensible_type_only() {
+        let f = parse_filter("(cn:=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: None,
+                attr_type: Some("cn".into()),
+                match_value: "foo".into(),
+                dn_attributes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_dn() {
+        let f = parse_filter("(cn:dn:=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: None,
+                attr_type: Some("cn".into()),
+                match_value: "foo".into(),
+                dn_attributes: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_rule() {
+        let f = parse_filter("(cn:1.2.3.4:=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("1.2.3.4".into()),
+                attr_type: Some("cn".into()),
+                match_value: "foo".into(),
+                dn_attributes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_dn_and_rule() {
+        let f = parse_filter("(cn:dn:caseIgnoreMatch:=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseIgnoreMatch".into()),
+                attr_type: Some("cn".into()),
+                match_value: "foo".into(),
+                dn_attributes: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_rule_no_type() {
+        let f = parse_filter("(:caseExactMatch:=bar)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseExactMatch".into()),
+                attr_type: None,
+                match_value: "bar".into(),
+                dn_attributes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_dn_rule_no_type() {
+        let f = parse_filter("(:dn:caseExactMatch:=bar)").unwrap();
+        assert_eq!(
+            f,
+            Filter::ExtensibleMatch {
+                matching_rule: Some("caseExactMatch".into()),
+                attr_type: None,
+                match_value: "bar".into(),
+                dn_attributes: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_extensible_rejects_control_bytes() {
+        // A control byte in the value is rejected by reject_ctl.
+        assert!(parse_filter("(cn:=foo\nbar)").is_err());
+        assert!(parse_filter("(cn:=foo\0bar)").is_err());
+    }
+
+    #[test]
+    fn parse_filter_plain_equality_not_extensible() {
+        // A `=` without a preceding `:` stays equality, never extensible.
+        let f = parse_filter("(cn=foo)").unwrap();
+        assert_eq!(
+            f,
+            Filter::EqualityMatch {
+                attr: "cn".into(),
+                value: "foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn encode_extensible_type_only_tags() {
+        // (cn:=foo) -> [9] constructed (0xA9) { type [2], matchValue [3] }
+        // No matchingRule [1], no dnAttributes [4].
+        let f = parse_filter("(cn:=foo)").unwrap();
+        let buf = encode_one(&f);
+        assert_eq!(buf[0], 0xA9, "extensible match tag must be [9] constructed");
+        assert_eq!(buf[0], tag::ctx(9, true));
+        let mut r = BerReader::new(&buf);
+        let body = r.read_expect(tag::ctx(9, true)).unwrap();
+        let mut mr = BerReader::new(body);
+        // First child is type [2] (no matchingRule [1]).
+        let t = mr.read_tlv().unwrap();
+        assert_eq!(t.tag, 0x82, "type must be [2] primitive");
+        assert_eq!(t.tag, tag::ctx(2, false));
+        assert_eq!(t.value, b"cn");
+        let v = mr.read_tlv().unwrap();
+        assert_eq!(v.tag, 0x83, "matchValue must be [3] primitive");
+        assert_eq!(v.tag, tag::ctx(3, false));
+        assert_eq!(v.value, b"foo");
+        assert!(mr.is_empty(), "no matchingRule [1] and no dnAttributes [4]");
+        // Belt-and-braces: the encoded bytes carry neither 0x81 nor 0x84.
+        assert!(!body.contains(&0x84), "dnAttributes [4] must be absent");
+    }
+
+    #[test]
+    fn encode_extensible_dn_attributes() {
+        // (cn:dn:=foo) -> dnAttributes [4] BOOLEAN TRUE = 0x84 0x01 0xFF.
+        let f = parse_filter("(cn:dn:=foo)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let body = r.read_expect(tag::ctx(9, true)).unwrap();
+        let mut mr = BerReader::new(body);
+        let t = mr.read_tlv().unwrap();
+        assert_eq!(t.tag, tag::ctx(2, false));
+        assert_eq!(t.value, b"cn");
+        let v = mr.read_tlv().unwrap();
+        assert_eq!(v.tag, tag::ctx(3, false));
+        assert_eq!(v.value, b"foo");
+        let dn = mr.read_tlv().unwrap();
+        assert_eq!(dn.tag, 0x84, "dnAttributes must be [4] primitive");
+        assert_eq!(dn.tag, tag::ctx(4, false));
+        assert_eq!(dn.value, &[0xff], "dnAttributes TRUE is a single 0xFF byte");
+        assert!(mr.is_empty());
+        // The raw bytes 84 01 FF appear in order.
+        assert!(
+            body.windows(3).any(|w| w == [0x84, 0x01, 0xff]),
+            "expected 0x84 0x01 0xFF"
+        );
+    }
+
+    #[test]
+    fn encode_extensible_matching_rule_ordering() {
+        // (cn:1.2.3.4:=foo) -> matchingRule [1] before type [2] before value.
+        let f = parse_filter("(cn:1.2.3.4:=foo)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let body = r.read_expect(tag::ctx(9, true)).unwrap();
+        let mut mr = BerReader::new(body);
+        let rule = mr.read_tlv().unwrap();
+        assert_eq!(rule.tag, 0x81, "matchingRule must be [1] primitive");
+        assert_eq!(rule.tag, tag::ctx(1, false));
+        assert_eq!(rule.value, b"1.2.3.4");
+        let t = mr.read_tlv().unwrap();
+        assert_eq!(t.tag, tag::ctx(2, false));
+        assert_eq!(t.value, b"cn");
+        let v = mr.read_tlv().unwrap();
+        assert_eq!(v.tag, tag::ctx(3, false));
+        assert_eq!(v.value, b"foo");
+        assert!(mr.is_empty());
+    }
+
+    #[test]
+    fn encode_extensible_dn_and_rule() {
+        // (cn:dn:caseIgnoreMatch:=foo) -> rule [1], type [2], value [3], dn [4].
+        let f = parse_filter("(cn:dn:caseIgnoreMatch:=foo)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let body = r.read_expect(tag::ctx(9, true)).unwrap();
+        let mut mr = BerReader::new(body);
+        let rule = mr.read_tlv().unwrap();
+        assert_eq!(rule.tag, tag::ctx(1, false));
+        assert_eq!(rule.value, b"caseIgnoreMatch");
+        let t = mr.read_tlv().unwrap();
+        assert_eq!(t.tag, tag::ctx(2, false));
+        assert_eq!(t.value, b"cn");
+        let v = mr.read_tlv().unwrap();
+        assert_eq!(v.tag, tag::ctx(3, false));
+        assert_eq!(v.value, b"foo");
+        let dn = mr.read_tlv().unwrap();
+        assert_eq!(dn.tag, tag::ctx(4, false));
+        assert_eq!(dn.value, &[0xff]);
+        assert!(mr.is_empty());
+    }
+
+    #[test]
+    fn encode_extensible_rule_no_type_tags() {
+        // (:caseExactMatch:=bar) -> matchingRule [1] present, NO type [2].
+        let f = parse_filter("(:caseExactMatch:=bar)").unwrap();
+        let buf = encode_one(&f);
+        let mut r = BerReader::new(&buf);
+        let body = r.read_expect(tag::ctx(9, true)).unwrap();
+        let mut mr = BerReader::new(body);
+        let rule = mr.read_tlv().unwrap();
+        assert_eq!(rule.tag, 0x81, "matchingRule [1] must be present");
+        assert_eq!(rule.value, b"caseExactMatch");
+        let v = mr.read_tlv().unwrap();
+        assert_eq!(v.tag, 0x83, "next child is matchValue [3], not type [2]");
+        assert_eq!(v.value, b"bar");
+        assert!(mr.is_empty());
+        // No type [2] tag anywhere in the assertion body.
+        assert!(!body.contains(&0x82), "type [2] must be absent");
     }
 
     #[test]
