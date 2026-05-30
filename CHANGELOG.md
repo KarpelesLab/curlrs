@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/rsurl/compare/v0.0.2...v0.0.3) - 2026-05-30
+
+### Other
+
+- add sftp:// and scp:// (download + upload) via puressh; bump MSRV to 1.95
+- emit curl-style -v verbose trace (request/response/TLS/body)
+- implement APPE append mode (-a/--append)
+- implement extensibleMatch filters (RFC 4515 :=, dn, matchingRule)
+- implement permessage-deflate (RFC 7692)
+- implement QPACK dynamic table decoding (encoder-stream inserts + dynamic field-line refs)
+- decode Content-Encoding: compress (LZW / .Z) via compcol
+- implement PUBLISH (QoS 0/1) publisher side, wire -d/-T for mqtt://
+- CAPABILITY, STARTTLS upgrade, and SASL AUTHENTICATE (PLAIN/LOGIN)
+- process-wide connection pool — reuse h2 connections across requests
+- correct HTTP/3 status (QPACK Huffman implemented; dynamic table is the remaining TODO)
+- decode zstd and brotli (br) responses via compcol (pure-Rust)
+- implement substring and presence filters (RFC 4515)
+- implement item-type 7 search (selector\tquery)
+- SETUP/PLAY/OPTIONS/TEARDOWN session flow with CSeq + Session tracking
+- implement WRQ upload (write side), wire -T for tftp://
+- implement STOR upload and REST resume, wire -T for ftp://
+- bidirectional frames, fragmentation reassembly, ping/pong/close
+- implement connection + stream flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE)
+
 ## [0.0.2](https://github.com/KarpelesLab/rsurl/compare/v0.0.1...v0.0.2) - 2026-05-30
 
 ### Other
