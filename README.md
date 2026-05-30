@@ -38,7 +38,7 @@ Early, in active development.
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
 | RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
 | TFTP (RFC 1350) | working | read (RRQ) and write/upload (`-T`, WRQ) with timeout/retry, 256 MiB cap |
-| WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling |
+| WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling; permessage-deflate (RFC 7692) negotiated in the upgrade — per-message inflate/deflate with RSV1, `client/server_no_context_takeover`, inflated-size cap against compression bombs |
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
 worktree. Available via `--http2` (force) or auto-negotiated via ALPN.

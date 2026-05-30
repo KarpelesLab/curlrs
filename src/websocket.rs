@@ -20,10 +20,21 @@
 //!     handled both while waiting for the first data frame and in between
 //!     fragments. Per §5.4/§5.5 control frames must not be fragmented and
 //!     carry at most 125 bytes; violations are rejected as protocol errors.
+//!   * permessage-deflate (RFC 7692): the upgrade request offers the
+//!     extension (with `client_no_context_takeover` /
+//!     `server_no_context_takeover` and `client_max_window_bits`). If the
+//!     server agrees, data messages whose first frame has RSV1 set are
+//!     per-message DEFLATE-compressed (RFC 1951 raw deflate) — we append the
+//!     `00 00 FF FF` empty-block terminator the sender strips and inflate,
+//!     bounding the inflated size against [`MAX_PAYLOAD_BYTES`] so a
+//!     compression bomb can't bypass the cap. Outgoing messages are deflated
+//!     and flagged with RSV1 when compression is negotiated. RSV1 is rejected
+//!     when compression was *not* negotiated, RSV2/RSV3 are always rejected,
+//!     and RSV1 on a control frame is rejected. See [`Pmd`] for the
+//!     context-takeover decision.
 //!
 //! Limitations of this scaffold (intentionally deferred):
 //!   * Streaming/large payloads — the whole message is buffered in memory.
-//!   * permessage-deflate or any other extension.
 //!   * Ping *intervals* / timer-driven keepalive; we react to peer pings but
 //!     do not proactively send our own on a schedule.
 
@@ -31,6 +42,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use compcol::deflate::Deflate;
+use compcol::limit::LimitedDecoder;
+use compcol::vec::compress_to_vec;
+use compcol::{Algorithm, Decoder, Status};
 use purecrypto::hash::{Digest, Sha1};
 
 use crate::error::{Error, Result};
@@ -38,6 +53,11 @@ use crate::tls::TlsStream;
 use crate::url::Url;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// The empty-block terminator a permessage-deflate sender strips from the
+/// tail of each deflated message (RFC 7692 §7.2.1) and the receiver appends
+/// back before inflating (§7.2.2).
+const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 
 const OPCODE_CONT: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
@@ -48,6 +68,138 @@ const OPCODE_PONG: u8 = 0xA;
 
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The permessage-deflate offer we put in the upgrade request. We advertise
+/// `client_no_context_takeover` and `server_no_context_takeover` so each
+/// message inflates/deflates independently (no sliding window carried across
+/// messages), which keeps state bounded and the implementation simple. We
+/// also offer `client_max_window_bits` so a server that wants to shrink our
+/// (notional) window can; we don't carry context anyway, so any value it
+/// echoes is fine.
+const PMD_OFFER: &str =
+    "permessage-deflate; client_no_context_takeover; server_no_context_takeover; client_max_window_bits";
+
+/// Negotiated permessage-deflate (RFC 7692) state for a connection.
+///
+/// ## Context-takeover decision
+///
+/// We always operate our **send** side in no-context-takeover mode: every
+/// outgoing message is an independent raw-DEFLATE stream produced by a fresh
+/// encoder. That is why we offer `client_no_context_takeover` — it lets the
+/// peer reset its inflater per message to match.
+///
+/// On the **receive** side we honour what the server negotiated. The
+/// underlying `compcol` raw-deflate decoder keeps a 32 KiB sliding window and
+/// can carry it across separate `decode` calls, so a persistent inflate
+/// context across messages is supported: we keep one decoder and only
+/// [`reset`](Decoder::reset) it per message when `server_no_context_takeover`
+/// was agreed. Since our offer always includes `server_no_context_takeover`,
+/// a compliant server typically agrees to it and we reset each message; but
+/// if it declines, the persistent-window path keeps us correct.
+struct Pmd {
+    /// `client_no_context_takeover` was agreed: our encoder is fresh per
+    /// message (always true for us — we never carry send context). Recorded
+    /// for completeness/observability; our send path is unconditionally
+    /// no-context-takeover, so we don't branch on it.
+    #[allow(dead_code)]
+    client_no_context_takeover: bool,
+    /// `server_no_context_takeover` was agreed: reset the inflate decoder
+    /// before each incoming message rather than carrying its window.
+    server_no_context_takeover: bool,
+    /// Persistent inflate context, reused across messages when the server
+    /// did not agree `server_no_context_takeover`.
+    decoder: <Deflate as Algorithm>::Decoder,
+}
+
+impl Pmd {
+    /// Inflate one full (reassembled) compressed message payload. Appends the
+    /// stripped `00 00 FF FF` terminator (RFC 7692 §7.2.2) and runs raw
+    /// DEFLATE, bounding the inflated output at [`MAX_PAYLOAD_BYTES`] so a
+    /// compression bomb can't slip past the cap. The decoder's sliding window
+    /// is carried across messages unless `server_no_context_takeover` was
+    /// negotiated, in which case it is reset first.
+    fn inflate_message(&mut self, compressed: &[u8]) -> Result<Vec<u8>> {
+        if self.server_no_context_takeover {
+            self.decoder.reset();
+        }
+        // RFC 7692 §7.2.2: append the empty-block terminator the sender
+        // stripped, then inflate.
+        let mut input = Vec::with_capacity(compressed.len() + DEFLATE_TAIL.len());
+        input.extend_from_slice(compressed);
+        input.extend_from_slice(&DEFLATE_TAIL);
+
+        // Bound the inflated output against the cap, exactly like compress.rs's
+        // LimitedDecoder path, so a compressed bomb can't expand past
+        // MAX_PAYLOAD_BYTES. `LimitedDecoder` takes the decoder by value, so we
+        // move our persistent decoder into it, run, then recover it via
+        // `into_inner` — preserving its 32 KiB window for the next message
+        // (the context-takeover path).
+        let taken = std::mem::replace(&mut self.decoder, Deflate::decoder());
+        let mut limited = LimitedDecoder::new(taken, MAX_PAYLOAD_BYTES);
+
+        let result = Self::run_inflate(&mut limited, &input);
+        // Restore the (now advanced) decoder regardless of outcome.
+        self.decoder = limited.into_inner();
+        result
+    }
+
+    /// Drive the bounded decoder over `input`, collecting all inflated output.
+    /// Stops at stream end (our own BFINAL=1 messages) or when the input is
+    /// exhausted with no further progress (a peer's sync-flushed message,
+    /// whose final empty block leaves the decoder parked in `InputEmpty`).
+    fn run_inflate(
+        limited: &mut LimitedDecoder<<Deflate as Algorithm>::Decoder>,
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut consumed = 0usize;
+        loop {
+            let before_consumed = consumed;
+            let before_written = out.len();
+            let (p, status) = limited
+                .decode(&input[consumed..], &mut scratch)
+                .map_err(|e| {
+                    Error::BadResponse(format!("permessage-deflate inflate failed: {e}"))
+                })?;
+            out.extend_from_slice(&scratch[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::StreamEnd => break,
+                Status::OutputFull => continue,
+                Status::InputEmpty => {
+                    if consumed >= input.len()
+                        || (consumed == before_consumed && out.len() == before_written)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Deflate one application message for sending (RFC 7692 §7.2.1). Produces a
+/// fresh raw-DEFLATE stream (no context carried — we always operate the send
+/// side in no-context-takeover mode). `compcol`'s encoder terminates the
+/// stream with a BFINAL=1 block rather than a `Z_SYNC_FLUSH`, so there is no
+/// trailing `00 00 FF FF` to strip; the receiver appends its own terminator
+/// and, on hitting our final block, recovers the exact payload (the appended
+/// tail is then harmlessly ignored). This is spec-legal and, paired with our
+/// `client_no_context_takeover` offer, lets the peer reset its inflater each
+/// message.
+fn deflate_message(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut out = compress_to_vec::<Deflate>(payload)
+        .map_err(|e| Error::BadResponse(format!("permessage-deflate deflate failed: {e}")))?;
+    // If the encoder ever did emit the sync-flush terminator, strip it per
+    // §7.2.1. compcol terminates with a final block today, so this is a
+    // forward-compatible no-op, but it keeps us correct if that changes.
+    if out.ends_with(&DEFLATE_TAIL) {
+        out.truncate(out.len() - DEFLATE_TAIL.len());
+    }
+    Ok(out)
+}
+
 /// Open a WS connection, read one full text or binary message (reassembling
 /// fragments and answering any interleaved ping/close control frames), send a
 /// close, and return that message's payload.
@@ -55,14 +207,14 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "ws" => {
             let mut sock = tcp_connect(url)?;
-            handshake(&mut sock, url)?;
-            read_data_and_close(&mut sock)
+            let mut pmd = handshake(&mut sock, url)?;
+            read_data_and_close(&mut sock, pmd.as_mut())
         }
         "wss" => {
             let tcp = tcp_connect(url)?;
             let mut tls = crate::tls::connect_over(tcp, &url.host)?;
-            handshake(&mut tls, url)?;
-            read_data_and_close(&mut tls)
+            let mut pmd = handshake(&mut tls, url)?;
+            read_data_and_close(&mut tls, pmd.as_mut())
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
@@ -83,7 +235,11 @@ fn tcp_connect(url: &Url) -> Result<TcpStream> {
 
 /// Drive the HTTP/1.1 upgrade handshake on `stream`. After this returns, the
 /// stream sits at the first byte of the first WS frame.
-fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
+///
+/// Returns `Some(Pmd)` if the server agreed to permessage-deflate (RFC 7692),
+/// `None` otherwise (in which case the connection operates uncompressed,
+/// exactly as before).
+fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> {
     let key_bytes: [u8; 16] = random_16()?;
     let key_b64 = base64_encode(&key_bytes);
 
@@ -107,6 +263,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key_b64}\r\n\
          Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Extensions: {PMD_OFFER}\r\n\
          \r\n"
     );
     stream.write_all(req.as_bytes())?;
@@ -146,6 +303,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
     let mut upgrade_ok = false;
     let mut connection_ok = false;
     let mut accept_value: Option<String> = None;
+    let mut extensions_value: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -167,6 +325,16 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
             }
         } else if k.eq_ignore_ascii_case("sec-websocket-accept") {
             accept_value = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("sec-websocket-extensions") {
+            // A server may repeat the header; concatenate as the spec allows
+            // a comma-joined list to be split across lines.
+            match &mut extensions_value {
+                Some(existing) => {
+                    existing.push_str(", ");
+                    existing.push_str(v);
+                }
+                None => extensions_value = Some(v.to_string()),
+            }
         }
     }
     if !upgrade_ok {
@@ -188,7 +356,56 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
         )));
     }
 
-    Ok(())
+    // If the server accepted permessage-deflate, enable compression and record
+    // the negotiated context-takeover parameters. Otherwise operate
+    // uncompressed exactly as before.
+    let pmd = extensions_value.as_deref().and_then(parse_pmd_response);
+
+    Ok(pmd)
+}
+
+/// Parse a `Sec-WebSocket-Extensions` response value and, if it selects
+/// `permessage-deflate`, return the negotiated [`Pmd`] state. Returns `None`
+/// if permessage-deflate was not selected.
+///
+/// The header is a comma-separated list of extensions, each a semicolon-
+/// separated list of `token[=value]` parameters (RFC 7692 §7 / RFC 6455 §9.1).
+/// We look only at the first `permessage-deflate` offer the server returned
+/// (a compliant server returns at most one) and read the two
+/// context-takeover flags; `*_max_window_bits` values are accepted but, since
+/// we never carry a window on our side and bound the inflate output by byte
+/// count regardless, they don't change our behaviour.
+fn parse_pmd_response(value: &str) -> Option<Pmd> {
+    for ext in value.split(',') {
+        let mut params = ext.split(';').map(str::trim);
+        let name = params.next()?;
+        if !name.eq_ignore_ascii_case("permessage-deflate") {
+            continue;
+        }
+        let mut client_no_context_takeover = false;
+        let mut server_no_context_takeover = false;
+        for param in params {
+            if param.is_empty() {
+                continue;
+            }
+            // A parameter may be `token` or `token=value`; we only key off the
+            // token names here.
+            let token = param.split('=').next().unwrap_or(param).trim();
+            if token.eq_ignore_ascii_case("client_no_context_takeover") {
+                client_no_context_takeover = true;
+            } else if token.eq_ignore_ascii_case("server_no_context_takeover") {
+                server_no_context_takeover = true;
+            }
+            // client_max_window_bits / server_max_window_bits are accepted but
+            // intentionally ignored (see the doc comment).
+        }
+        return Some(Pmd {
+            client_no_context_takeover,
+            server_no_context_takeover,
+            decoder: Deflate::decoder(),
+        });
+    }
+    None
 }
 
 /// What [`read_message`] produced for the caller.
@@ -215,10 +432,21 @@ const MAX_CONTROL_PAYLOAD: usize = 125;
 /// CONTINUATION frames until FIN=1) are stitched together, with the
 /// cumulative size enforced against [`MAX_PAYLOAD_BYTES`] so a fragmented
 /// payload cannot exceed the cap that a single frame would be held to.
-fn read_message<S: Read + Write>(stream: &mut S) -> Result<Message> {
+///
+/// permessage-deflate (RFC 7692 §7.2.2): if `pmd` is `Some` (the extension
+/// was negotiated) and the FIRST frame of a data message has RSV1 set, the
+/// reassembled payload is raw-DEFLATE-compressed and is inflated before
+/// returning, with the cumulative cap enforced on the *inflated* size. RSV1 is
+/// rejected when compression was not negotiated; RSV1 on a control frame is
+/// rejected; RSV1 only carries meaning on the first frame of a message (it
+/// must be 0 on continuation frames).
+fn read_message<S: Read + Write>(stream: &mut S, mut pmd: Option<&mut Pmd>) -> Result<Message> {
     // State for an in-progress fragmented data message. `None` means we are
     // not currently inside a fragmentation chain.
     let mut frag_opcode: Option<u8> = None;
+    // Whether the in-progress message is permessage-deflate compressed (RSV1
+    // was set on its first frame).
+    let mut compressed = false;
     let mut buf: Vec<u8> = Vec::new();
 
     loop {
@@ -227,6 +455,9 @@ fn read_message<S: Read + Write>(stream: &mut S) -> Result<Message> {
         // Control frames (opcode >= 0x8) may be interleaved between fragments
         // but MUST NOT themselves be fragmented and MUST have payload <= 125.
         if frame.opcode >= 0x8 {
+            if frame.rsv1 {
+                return Err(Error::BadResponse("RSV1 set on a WS control frame".into()));
+            }
             if !frame.fin {
                 return Err(Error::BadResponse(
                     "fragmented control frame (FIN=0 on a control opcode)".into(),
@@ -271,12 +502,20 @@ fn read_message<S: Read + Write>(stream: &mut S) -> Result<Message> {
                         "new data frame began while a fragmented message was in progress".into(),
                     ));
                 }
+                // RSV1 on the first data frame means a compressed message — but
+                // only if permessage-deflate was negotiated. Reject otherwise.
+                if frame.rsv1 {
+                    if pmd.is_none() {
+                        return Err(Error::BadResponse(
+                            "RSV1 set on a WS frame but permessage-deflate was not negotiated"
+                                .into(),
+                        ));
+                    }
+                    compressed = true;
+                }
                 accumulate(&mut buf, &frame.payload)?;
                 if frame.fin {
-                    return Ok(Message::Data {
-                        opcode: frame.opcode,
-                        payload: buf,
-                    });
+                    return finish_data_message(frame.opcode, buf, compressed, pmd.as_deref_mut());
                 }
                 frag_opcode = Some(frame.opcode);
             }
@@ -284,18 +523,46 @@ fn read_message<S: Read + Write>(stream: &mut S) -> Result<Message> {
                 let opcode = frag_opcode.ok_or_else(|| {
                     Error::BadResponse("continuation frame with no message in progress".into())
                 })?;
+                // RSV1 is only meaningful on the first frame of a message; a
+                // continuation frame must clear it (RFC 7692 §7.2.2).
+                if frame.rsv1 {
+                    return Err(Error::BadResponse(
+                        "RSV1 set on a WS continuation frame".into(),
+                    ));
+                }
                 accumulate(&mut buf, &frame.payload)?;
                 if frame.fin {
-                    return Ok(Message::Data {
-                        opcode,
-                        payload: buf,
-                    });
+                    return finish_data_message(opcode, buf, compressed, pmd.as_deref_mut());
                 }
             }
             other => {
                 return Err(Error::BadResponse(format!("unknown WS opcode 0x{other:x}")));
             }
         }
+    }
+}
+
+/// Finalise a reassembled data message: inflate it if it was permessage-
+/// deflate compressed, then hand it back as a [`Message::Data`]. When
+/// `compressed` is set, `pmd` must be `Some` (the read loop only sets
+/// `compressed` after confirming negotiation).
+fn finish_data_message(
+    opcode: u8,
+    payload: Vec<u8>,
+    compressed: bool,
+    pmd: Option<&mut Pmd>,
+) -> Result<Message> {
+    if compressed {
+        let pmd = pmd.ok_or_else(|| {
+            Error::BadResponse("compressed WS message without negotiated permessage-deflate".into())
+        })?;
+        let inflated = pmd.inflate_message(&payload)?;
+        Ok(Message::Data {
+            opcode,
+            payload: inflated,
+        })
+    } else {
+        Ok(Message::Data { opcode, payload })
     }
 }
 
@@ -317,14 +584,30 @@ fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
 /// [`OPCODE_BINARY`]; the payload is masked per RFC 6455 §5.3 using the
 /// crate's CSPRNG. Exposed for a transfer/CLI layer to drive the send side
 /// (not yet wired into the one-shot `fetch` path, hence `dead_code`).
+///
+/// When `pmd` is `Some` (permessage-deflate was negotiated), the payload is
+/// raw-DEFLATE-compressed (RFC 7692 §7.2.1) and the frame's RSV1 bit is set.
+/// We always compress and never carry encoder context across messages, so
+/// each message is an independent stream (consistent with our
+/// `client_no_context_takeover` offer).
 #[allow(dead_code)]
-fn send_message<S: Write>(stream: &mut S, opcode: u8, payload: &[u8]) -> Result<()> {
+fn send_message<S: Write>(
+    stream: &mut S,
+    opcode: u8,
+    payload: &[u8],
+    pmd: Option<&mut Pmd>,
+) -> Result<()> {
     if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
         return Err(Error::BadResponse(format!(
             "send_message expects a data opcode (text/binary), got 0x{opcode:x}"
         )));
     }
-    let frame = build_client_frame(opcode, payload)?;
+    let frame = if pmd.is_some() {
+        let compressed = deflate_message(payload)?;
+        build_client_frame_rsv1(opcode, &compressed)?
+    } else {
+        build_client_frame(opcode, payload)?
+    };
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
@@ -334,8 +617,8 @@ fn send_message<S: Write>(stream: &mut S, opcode: u8, payload: &[u8]) -> Result<
 /// frame and return that message's payload. Interleaved pings are answered
 /// with pongs; a close from the server short-circuits to returning whatever
 /// (likely empty) payload we have collected.
-fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
-    let payload = match read_message(stream)? {
+fn read_data_and_close<S: Read + Write>(stream: &mut S, pmd: Option<&mut Pmd>) -> Result<Vec<u8>> {
+    let payload = match read_message(stream, pmd)? {
         Message::Data { payload, .. } => payload,
         // Peer closed before sending data; read_message already replied.
         Message::Closed => return Ok(Vec::new()),
@@ -358,20 +641,29 @@ fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
     fin: bool,
+    /// RSV1 bit. For data messages this signals a permessage-deflate
+    /// compressed payload (RFC 7692 §7.2.2) when set on the first frame.
+    rsv1: bool,
     opcode: u8,
     payload: Vec<u8>,
 }
 
 /// Parse a single frame off the wire. Server-to-client frames must NOT be
 /// masked per RFC 6455 §5.1; a masked frame is rejected as a protocol error.
+///
+/// RSV2 and RSV3 are always rejected (no extension that uses them is
+/// negotiated). RSV1 is surfaced via [`Frame::rsv1`]; whether it is legal
+/// depends on context (permessage-deflate negotiation + frame type), which is
+/// enforced by the caller in [`read_message`].
 fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
     let mut header = [0u8; 2];
     read_exact(stream, &mut header)?;
     let fin = (header[0] & 0x80) != 0;
-    // RSV1/2/3 must be zero unless an extension has been negotiated.
-    if (header[0] & 0x70) != 0 {
+    let rsv1 = (header[0] & 0x40) != 0;
+    // RSV2/RSV3 must always be zero — no extension using them is negotiated.
+    if (header[0] & 0x30) != 0 {
         return Err(Error::BadResponse(
-            "non-zero RSV bits on incoming WS frame".into(),
+            "non-zero RSV2/RSV3 bits on incoming WS frame".into(),
         ));
     }
     let opcode = header[0] & 0x0F;
@@ -407,6 +699,7 @@ fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
     }
     Ok(Frame {
         fin,
+        rsv1,
         opcode,
         payload,
     })
@@ -416,12 +709,24 @@ fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
 /// payload. Client frames must be masked (RFC 6455 §5.3), and the mask must
 /// be unpredictable, so this fails if no secure entropy source is available.
 fn build_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    build_client_frame_inner(opcode, payload, false)
+}
+
+/// Like [`build_client_frame`] but with the RSV1 bit set, marking the payload
+/// as permessage-deflate compressed (RFC 7692 §7.2.1). Only valid on a data
+/// frame; callers guarantee that.
+fn build_client_frame_rsv1(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    build_client_frame_inner(opcode, payload, true)
+}
+
+fn build_client_frame_inner(opcode: u8, payload: &[u8], rsv1: bool) -> Result<Vec<u8>> {
     let mask: [u8; 4] = {
         let r = random_16()?;
         [r[0], r[1], r[2], r[3]]
     };
     let mut out = Vec::with_capacity(2 + 8 + 4 + payload.len());
-    out.push(0x80 | (opcode & 0x0F)); // FIN=1 + opcode
+    let rsv1_bit = if rsv1 { 0x40 } else { 0x00 };
+    out.push(0x80 | rsv1_bit | (opcode & 0x0F)); // FIN=1 (+ RSV1) + opcode
     let n = payload.len();
     if n < 126 {
         out.push(0x80 | (n as u8));
@@ -579,6 +884,35 @@ mod tests {
         }
         out.extend_from_slice(payload);
         out
+    }
+
+    /// Like [`server_frame`] but with the RSV1 bit set on the header — used to
+    /// feed permessage-deflate compressed frames into the mock stream.
+    fn server_frame_rsv1(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = server_frame(fin, opcode, payload);
+        out[0] |= 0x40; // set RSV1
+        out
+    }
+
+    /// Raw-DEFLATE-compress `data` with compcol and strip the trailing
+    /// `00 00 FF FF` terminator if present, producing a permessage-deflate
+    /// message payload (RFC 7692 §7.2.1).
+    fn pmd_compress(data: &[u8]) -> Vec<u8> {
+        let mut out = compress_to_vec::<Deflate>(data).expect("deflate encode");
+        if out.ends_with(&DEFLATE_TAIL) {
+            out.truncate(out.len() - DEFLATE_TAIL.len());
+        }
+        out
+    }
+
+    /// A negotiated [`Pmd`] in `server_no_context_takeover` mode (the common
+    /// case for our offer), for driving the receive path in tests.
+    fn test_pmd() -> Pmd {
+        Pmd {
+            client_no_context_takeover: true,
+            server_no_context_takeover: true,
+            decoder: Deflate::decoder(),
+        }
     }
 
     /// Decode every frame the client wrote into `sent`, returning
@@ -753,7 +1087,7 @@ mod tests {
         inbound.extend(server_frame(false, OPCODE_CONT, b"lo "));
         inbound.extend(server_frame(true, OPCODE_CONT, b"world"));
         let mut s = MockStream::new(inbound);
-        let msg = read_message(&mut s).expect("reassembles");
+        let msg = read_message(&mut s, None).expect("reassembles");
         assert_eq!(
             msg,
             Message::Data {
@@ -772,7 +1106,7 @@ mod tests {
         inbound.extend(server_frame(true, OPCODE_PING, b"pingdata"));
         inbound.extend(server_frame(true, OPCODE_CONT, b"bar"));
         let mut s = MockStream::new(inbound);
-        let msg = read_message(&mut s).expect("completes despite ping");
+        let msg = read_message(&mut s, None).expect("completes despite ping");
         assert_eq!(
             msg,
             Message::Data {
@@ -790,7 +1124,7 @@ mod tests {
     fn close_is_answered_and_returns_closed() {
         let inbound = server_frame(true, OPCODE_CLOSE, &[]);
         let mut s = MockStream::new(inbound);
-        let msg = read_message(&mut s).expect("handles close");
+        let msg = read_message(&mut s, None).expect("handles close");
         assert_eq!(msg, Message::Closed);
         let sent = decode_sent(&s.sent);
         assert_eq!(sent.len(), 1, "exactly one close reply expected");
@@ -802,7 +1136,7 @@ mod tests {
         let mut inbound = server_frame(true, OPCODE_PONG, b"x");
         inbound.extend(server_frame(true, OPCODE_TEXT, b"hi"));
         let mut s = MockStream::new(inbound);
-        let msg = read_message(&mut s).expect("ignores pong");
+        let msg = read_message(&mut s, None).expect("ignores pong");
         assert_eq!(
             msg,
             Message::Data {
@@ -817,7 +1151,7 @@ mod tests {
     #[test]
     fn send_message_produces_masked_frame() {
         let mut s = MockStream::new(Vec::new());
-        send_message(&mut s, OPCODE_TEXT, b"hello").expect("sends");
+        send_message(&mut s, OPCODE_TEXT, b"hello", None).expect("sends");
         // Raw bytes: FIN+text, MASK+len, 4-byte mask, 5 masked bytes.
         assert_eq!(s.sent[0], 0x81);
         assert_eq!(s.sent[1], 0x80 | 5);
@@ -829,7 +1163,7 @@ mod tests {
     #[test]
     fn send_message_rejects_control_opcode() {
         let mut s = MockStream::new(Vec::new());
-        let err = send_message(&mut s, OPCODE_PING, b"x")
+        let err = send_message(&mut s, OPCODE_PING, b"x", None)
             .expect_err("control opcode must be rejected for send_message");
         match err {
             Error::BadResponse(_) => {}
@@ -861,7 +1195,7 @@ mod tests {
         // A PING with FIN=0 is illegal: control frames must not be fragmented.
         let inbound = server_frame(false, OPCODE_PING, b"x");
         let mut s = MockStream::new(inbound);
-        let err = read_message(&mut s).expect_err("fragmented control must be rejected");
+        let err = read_message(&mut s, None).expect_err("fragmented control must be rejected");
         match err {
             Error::BadResponse(_) => {}
             other => panic!("wrong error: {other:?}"),
@@ -873,7 +1207,7 @@ mod tests {
         // A PING with a 126-byte payload exceeds the 125-byte control cap.
         let inbound = server_frame(true, OPCODE_PING, &[0u8; 126]);
         let mut s = MockStream::new(inbound);
-        let err = read_message(&mut s).expect_err("oversized control must be rejected");
+        let err = read_message(&mut s, None).expect_err("oversized control must be rejected");
         match err {
             Error::BadResponse(_) => {}
             other => panic!("wrong error: {other:?}"),
@@ -887,7 +1221,8 @@ mod tests {
         let mut inbound = server_frame(false, OPCODE_TEXT, b"a");
         inbound.extend(server_frame(true, OPCODE_TEXT, b"b"));
         let mut s = MockStream::new(inbound);
-        let err = read_message(&mut s).expect_err("interleaved new data frame must be rejected");
+        let err =
+            read_message(&mut s, None).expect_err("interleaved new data frame must be rejected");
         match err {
             Error::BadResponse(_) => {}
             other => panic!("wrong error: {other:?}"),
@@ -899,7 +1234,7 @@ mod tests {
         // A continuation frame with no message in progress is illegal.
         let inbound = server_frame(true, OPCODE_CONT, b"x");
         let mut s = MockStream::new(inbound);
-        let err = read_message(&mut s).expect_err("lone continuation must be rejected");
+        let err = read_message(&mut s, None).expect_err("lone continuation must be rejected");
         match err {
             Error::BadResponse(_) => {}
             other => panic!("wrong error: {other:?}"),
@@ -911,10 +1246,303 @@ mod tests {
         let mut inbound = server_frame(false, OPCODE_BINARY, &[1, 2, 3]);
         inbound.extend(server_frame(true, OPCODE_CONT, &[4, 5]));
         let mut s = MockStream::new(inbound);
-        let payload = read_data_and_close(&mut s).expect("reads message");
+        let payload = read_data_and_close(&mut s, None).expect("reads message");
         assert_eq!(payload, vec![1, 2, 3, 4, 5]);
         // A polite close should have been written.
         let sent = decode_sent(&s.sent);
         assert_eq!(sent.last().map(|f| f.0), Some(OPCODE_CLOSE));
+    }
+
+    // ─── permessage-deflate (RFC 7692) ──────────────────────────────────────
+
+    /// Decode one client frame including its RSV1 bit: `(opcode, rsv1, payload)`.
+    fn decode_first_frame_with_rsv1(sent: &[u8]) -> (u8, bool, Vec<u8>) {
+        let opcode = sent[0] & 0x0F;
+        let rsv1 = (sent[0] & 0x40) != 0;
+        let masked = (sent[1] & 0x80) != 0;
+        assert!(masked, "client frame must be masked");
+        let len7 = sent[1] & 0x7F;
+        let mut i = 2;
+        let len = match len7 {
+            0..=125 => len7 as usize,
+            126 => {
+                let l = u16::from_be_bytes([sent[i], sent[i + 1]]) as usize;
+                i += 2;
+                l
+            }
+            127 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&sent[i..i + 8]);
+                i += 8;
+                u64::from_be_bytes(b) as usize
+            }
+            _ => unreachable!(),
+        };
+        let mask = [sent[i], sent[i + 1], sent[i + 2], sent[i + 3]];
+        i += 4;
+        let mut payload = sent[i..i + len].to_vec();
+        for (j, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[j & 3];
+        }
+        (opcode, rsv1, payload)
+    }
+
+    /// Inflate a permessage-deflate payload the way a server would: append the
+    /// stripped terminator and run raw deflate.
+    fn pmd_inflate(compressed: &[u8]) -> Vec<u8> {
+        let mut input = compressed.to_vec();
+        input.extend_from_slice(&DEFLATE_TAIL);
+        let mut dec = Deflate::decoder();
+        let mut out = Vec::new();
+        let mut scratch = vec![0u8; 32 * 1024];
+        let mut consumed = 0usize;
+        loop {
+            let before_c = consumed;
+            let before_w = out.len();
+            let (p, status) = dec
+                .decode(&input[consumed..], &mut scratch)
+                .expect("inflate");
+            out.extend_from_slice(&scratch[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::StreamEnd => break,
+                Status::OutputFull => continue,
+                Status::InputEmpty => {
+                    if consumed >= input.len() || (consumed == before_c && out.len() == before_w) {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn handshake_offers_permessage_deflate() {
+        // The upgrade request must advertise a permessage-deflate offer. Drive
+        // a handshake against a mock server that returns a valid 101 and see
+        // what we wrote.
+        struct Recorder {
+            request: Vec<u8>,
+            response: Cursor<Vec<u8>>,
+        }
+        impl Read for Recorder {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.response.read(buf)
+            }
+        }
+        impl Write for Recorder {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.request.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // We can't predict the random key, so we can't precompute Accept; build
+        // the response after observing the request. Easiest: run handshake
+        // twice isn't possible on one stream, so instead capture the request
+        // by sending a deliberately-wrong response and asserting on the bytes
+        // we wrote before the Accept check fails.
+        let resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\n\r\n".to_vec();
+        let mut rec = Recorder {
+            request: Vec::new(),
+            response: Cursor::new(resp),
+        };
+        let url = Url::parse("ws://example.com/chat").expect("url");
+        let _ = handshake(&mut rec, &url); // Accept mismatch is fine here.
+        let req = String::from_utf8(rec.request).expect("utf8 request");
+        assert!(
+            req.contains("Sec-WebSocket-Extensions: permessage-deflate"),
+            "request must offer permessage-deflate, got:\n{req}"
+        );
+        assert!(req.contains("client_no_context_takeover"));
+        assert!(req.contains("server_no_context_takeover"));
+    }
+
+    #[test]
+    fn parse_pmd_response_enables_compression() {
+        let pmd = parse_pmd_response("permessage-deflate; server_no_context_takeover")
+            .expect("permessage-deflate accepted");
+        assert!(pmd.server_no_context_takeover);
+        assert!(!pmd.client_no_context_takeover);
+
+        let pmd2 = parse_pmd_response(
+            "permessage-deflate; client_no_context_takeover; server_no_context_takeover",
+        )
+        .expect("accepted with both flags");
+        assert!(pmd2.client_no_context_takeover);
+        assert!(pmd2.server_no_context_takeover);
+    }
+
+    #[test]
+    fn parse_pmd_response_without_extension_is_none() {
+        // No permessage-deflate token at all → compression stays off.
+        assert!(parse_pmd_response("some-other-extension").is_none());
+        assert!(parse_pmd_response("").is_none());
+        // A different (unrelated) extension alongside is still no PMD.
+        assert!(parse_pmd_response("foo; bar=1").is_none());
+    }
+
+    #[test]
+    fn inflate_compressed_message_decodes_to_original() {
+        // A known raw-DEFLATE payload (built with compcol, terminator stripped)
+        // framed with RSV1 set must decode back to the original string.
+        let original = b"the quick brown fox jumps over the lazy dog, the quick brown fox";
+        let compressed = pmd_compress(original);
+        assert!(
+            compressed.len() < original.len(),
+            "fixture should actually compress"
+        );
+        let inbound = server_frame_rsv1(true, OPCODE_TEXT, &compressed);
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let msg = read_message(&mut s, Some(&mut pmd)).expect("decodes compressed message");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: original.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn send_message_compressed_round_trips() {
+        // send_message with compression on must produce an RSV1 frame whose
+        // payload, once the terminator is appended and inflated, equals input.
+        let input = b"hello hello hello permessage-deflate round trip";
+        let mut s = MockStream::new(Vec::new());
+        let mut pmd = test_pmd();
+        send_message(&mut s, OPCODE_TEXT, input, Some(&mut pmd)).expect("sends compressed");
+        let (opcode, rsv1, payload) = decode_first_frame_with_rsv1(&s.sent);
+        assert_eq!(opcode, OPCODE_TEXT);
+        assert!(rsv1, "compressed frame must have RSV1 set");
+        assert_ne!(payload, input, "payload should be compressed, not raw");
+        assert_eq!(pmd_inflate(&payload), input);
+    }
+
+    #[test]
+    fn rsv1_without_negotiation_is_rejected() {
+        // RSV1 set on a data frame but compression was never negotiated (pmd
+        // is None) must be rejected as a protocol error.
+        let inbound = server_frame_rsv1(true, OPCODE_TEXT, b"whatever");
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s, None).expect_err("RSV1 without PMD must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rsv2_or_rsv3_always_rejected() {
+        // RSV2 set (0x20) — always illegal, even with PMD negotiated.
+        let mut inbound = server_frame(true, OPCODE_TEXT, b"x");
+        inbound[0] |= 0x20;
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let err = read_message(&mut s, Some(&mut pmd)).expect_err("RSV2 must be rejected");
+        assert!(matches!(err, Error::BadResponse(_)));
+
+        // RSV3 set (0x10) — likewise.
+        let mut inbound = server_frame(true, OPCODE_TEXT, b"x");
+        inbound[0] |= 0x10;
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let err = read_message(&mut s, Some(&mut pmd)).expect_err("RSV3 must be rejected");
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn rsv1_on_control_frame_is_rejected() {
+        // A PING with RSV1 set is illegal even when PMD is negotiated —
+        // compression applies to data messages only.
+        let inbound = server_frame_rsv1(true, OPCODE_PING, b"x");
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let err =
+            read_message(&mut s, Some(&mut pmd)).expect_err("RSV1 on control must be rejected");
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn compressed_bomb_exceeding_cap_is_rejected() {
+        // A highly-compressible payload that inflates beyond MAX_PAYLOAD_BYTES
+        // must be rejected by the bounded inflate, not materialised.
+        let huge = vec![0u8; (MAX_PAYLOAD_BYTES + (1 << 20)) as usize];
+        let compressed = pmd_compress(&huge);
+        assert!(
+            (compressed.len() as u64) < MAX_PAYLOAD_BYTES,
+            "fixture must be much smaller than the cap"
+        );
+        let inbound = server_frame_rsv1(true, OPCODE_BINARY, &compressed);
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let err =
+            read_message(&mut s, Some(&mut pmd)).expect_err("compression bomb must be rejected");
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("permessage-deflate"), "got {msg:?}")
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_compressed_message_reassembles_and_inflates() {
+        // RSV1 on the first frame, payload split across a TEXT(FIN=0) +
+        // CONTINUATION(FIN=1). The whole compressed blob is reassembled, then
+        // inflated as one unit.
+        let original = b"fragmented compressed payload, split across two frames on the wire";
+        let compressed = pmd_compress(original);
+        assert!(compressed.len() >= 4, "need enough bytes to split");
+        let mid = compressed.len() / 2;
+        let mut inbound = server_frame_rsv1(false, OPCODE_TEXT, &compressed[..mid]);
+        inbound.extend(server_frame(true, OPCODE_CONT, &compressed[mid..]));
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let msg = read_message(&mut s, Some(&mut pmd)).expect("reassembles + inflates");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: original.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn rsv1_on_continuation_frame_is_rejected() {
+        // RSV1 is only meaningful on a message's first frame; setting it on a
+        // continuation is a protocol error.
+        let original = b"continuation rsv1 should be rejected here";
+        let compressed = pmd_compress(original);
+        let mid = compressed.len() / 2;
+        let mut inbound = server_frame_rsv1(false, OPCODE_TEXT, &compressed[..mid]);
+        inbound.extend(server_frame_rsv1(true, OPCODE_CONT, &compressed[mid..]));
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let err = read_message(&mut s, Some(&mut pmd))
+            .expect_err("RSV1 on continuation must be rejected");
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn uncompressed_message_passes_through_when_pmd_negotiated() {
+        // Even with PMD negotiated, a server may send an uncompressed message
+        // (RSV1 clear). It must be returned verbatim, not run through inflate.
+        let inbound = server_frame(true, OPCODE_TEXT, b"plain text, no rsv1");
+        let mut s = MockStream::new(inbound);
+        let mut pmd = test_pmd();
+        let msg = read_message(&mut s, Some(&mut pmd)).expect("plain message");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: b"plain text, no rsv1".to_vec(),
+            }
+        );
     }
 }
