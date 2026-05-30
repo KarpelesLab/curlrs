@@ -262,7 +262,10 @@ fn matches_request(c: &Cookie, url: &crate::Url, now: u64) -> bool {
             return false;
         }
     }
-    if c.secure && url.scheme != "https" {
+    // A Secure cookie may only travel over a transport-secured scheme. Gate
+    // on the URL's actual TLS property rather than the literal "https" string
+    // so wss/ftps/etc. are handled correctly (RFC 6265 §5.4 step 1).
+    if c.secure && !url.is_tls() {
         return false;
     }
     if !domain_match(&url.host, &c.domain, c.host_only) {
@@ -352,6 +355,22 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
                 // Strip optional leading dot; non-empty after that is required.
                 let v = v.strip_prefix('.').unwrap_or(v).to_ascii_lowercase();
                 if v.is_empty() {
+                    continue;
+                }
+                // RFC 6265 §5.3 step 5: if the request host is an IP literal,
+                // a Domain= attribute is only honoured when it equals the host
+                // exactly; otherwise the cookie is host-only. Without this a
+                // pure suffix domain-match leaks across hosts — e.g. request
+                // host `127.0.0.1` would accept `Domain=0.0.1` (because
+                // "127.0.0.1".ends_with(".0.0.1")) and then broadcast to any
+                // host ending in `.0.0.1`. Fall back to host-only instead of
+                // taking the attacker-supplied suffix.
+                if is_ip_literal(&request_host) {
+                    if v != request_host {
+                        // Ignore the Domain= attribute; keep host-only default.
+                        continue;
+                    }
+                    // Domain equals the IP host exactly: still host-only.
                     continue;
                 }
                 // Minimal public-suffix guard (NOT a real PSL): reject a
@@ -496,7 +515,14 @@ fn try_asctime(s: &str) -> Option<u64> {
 }
 
 fn parse_month(s: &str) -> Option<u32> {
-    Some(match &s.to_ascii_lowercase()[..3] {
+    // `s` comes from an attacker-controlled `Expires=` header. A naive
+    // `&s.to_ascii_lowercase()[..3]` panics when the token is shorter than 3
+    // bytes or when byte index 3 isn't a UTF-8 char boundary (multibyte
+    // input) — a remote DoS. `get(..3)` returns None instead of panicking;
+    // month names are pure ASCII so an ASCII-lowercase of the 3-byte prefix
+    // is sufficient.
+    let prefix = s.get(..3)?.to_ascii_lowercase();
+    Some(match prefix.as_str() {
         "jan" => 1,
         "feb" => 2,
         "mar" => 3,
@@ -569,6 +595,30 @@ fn has_jar_separator(s: &str) -> bool {
 fn is_scopable_cookie_domain(domain: &str) -> bool {
     let d = domain.trim_matches('.');
     !d.is_empty() && d.contains('.')
+}
+
+/// `true` if `host` is an IP-address literal rather than a DNS name. Per
+/// RFC 6265 §5.3 a `Set-Cookie` with a `Domain=` attribute must be treated as
+/// host-only when the request host is an IP literal, so we never apply the
+/// subdomain suffix-match against an address. Detects:
+/// * IPv4 dotted-quad: exactly four `.`-separated parts, each a valid `u8`.
+/// * IPv6: a bracketed `[...]` form, or any host containing a `:` (the
+///   only place a colon can appear in a host is an IPv6 literal — the port
+///   has already been split off into `Url::port` by the time we see `host`).
+fn is_ip_literal(host: &str) -> bool {
+    // IPv6 literals are bracketed in URLs, or otherwise carry a colon.
+    if host.starts_with('[') || host.contains(':') {
+        return true;
+    }
+    // IPv4 dotted-quad: four parts, each parsing as a u8.
+    let mut parts = 0usize;
+    for part in host.split('.') {
+        if part.parse::<u8>().is_err() {
+            return false;
+        }
+        parts += 1;
+    }
+    parts == 4
 }
 
 fn unix_now() -> u64 {
@@ -940,6 +990,87 @@ mod tests {
         let j = CookieJar::load_netscape(path).unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(j.len(), 1, "host-only localhost cookie must load");
+    }
+
+    // FIX 1 (RFC 6265 §5.3): an IP-literal request host must never accept a
+    // suffix-matching Domain= attribute. The historic bug was that request
+    // host `127.0.0.1` accepted `Domain=0.0.1` (suffix match) and then leaked
+    // the cookie to any host ending in `.0.0.1`.
+    #[test]
+    fn ip_literal_host_rejects_suffix_domain_attribute() {
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("http://127.0.0.1/"), "evil=1; Domain=0.0.1", 0);
+        assert_eq!(j.len(), 1, "cookie should be kept but as host-only");
+        let c = &j.cookies[0];
+        assert!(c.host_only, "IP-literal host must force host-only");
+        assert_eq!(c.domain, "127.0.0.1");
+        // It must NOT leak to a sibling host ending in `.0.0.1`.
+        assert!(j.cookie_header(&url("http://10.0.0.1/")).is_none());
+        // And it still works for the exact host.
+        assert!(j.cookie_header(&url("http://127.0.0.1/")).is_some());
+    }
+
+    #[test]
+    fn ip_literal_host_exact_domain_is_host_only() {
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("http://127.0.0.1/"), "id=1; Domain=127.0.0.1", 0);
+        assert_eq!(j.len(), 1);
+        assert!(j.cookies[0].host_only, "exact IP Domain= stays host-only");
+    }
+
+    #[test]
+    fn is_ip_literal_classifies_hosts() {
+        assert!(is_ip_literal("127.0.0.1"));
+        assert!(is_ip_literal("10.0.0.1"));
+        assert!(is_ip_literal("[::1]"));
+        assert!(is_ip_literal("::1"));
+        assert!(is_ip_literal("fe80::1"));
+        assert!(!is_ip_literal("example.com"));
+        assert!(!is_ip_literal("0.0.1")); // only three octets
+        assert!(!is_ip_literal("999.0.0.1")); // 999 isn't a u8
+        assert!(!is_ip_literal("localhost"));
+    }
+
+    // FIX 2: a crafted multibyte `Expires=` month token must not panic the
+    // parser (remote DoS via slicing on a non-char-boundary or short token).
+    #[test]
+    fn parse_month_rejects_short_and_multibyte_without_panic() {
+        assert_eq!(parse_month("ja"), None); // shorter than 3 bytes
+        assert_eq!(parse_month(""), None);
+        assert_eq!(parse_month("é"), None); // 2-byte char, len 2 bytes
+        assert_eq!(parse_month("aé"), None); // byte 3 not a char boundary
+        assert_eq!(parse_month("zzz"), None); // unknown month
+        assert_eq!(parse_month("Jan"), Some(1)); // sanity: still works
+    }
+
+    #[test]
+    fn crafted_multibyte_expires_does_not_panic_and_is_session() {
+        // A full Set-Cookie carrying a multibyte month in Expires must parse
+        // to a session cookie (expires stays None) and never panic.
+        let mut j = CookieJar::new();
+        j.add_set_cookie(
+            &url("https://example.com/"),
+            "a=1; Expires=Sun, 06 é\u{00e9}é 1994 08:49:37 GMT",
+            1000,
+        );
+        assert_eq!(j.len(), 1);
+        assert_eq!(j.cookies[0].expires, None, "bad Expires → session cookie");
+    }
+
+    // FIX 3: a Secure cookie must be withheld over a non-TLS scheme, gated on
+    // the URL's transport security rather than the literal "https" string.
+    #[test]
+    fn secure_cookie_withheld_over_non_tls_scheme() {
+        let mut j = CookieJar::new();
+        // Receive over a TLS scheme so the Secure cookie is stored.
+        j.add_set_cookie(&url("https://example.com/"), "s=1; Secure", 0);
+        // Sent over https (TLS).
+        assert!(j.cookie_header(&url("https://example.com/")).is_some());
+        // Withheld over plain http (non-TLS).
+        assert!(j.cookie_header(&url("http://example.com/")).is_none());
+        // Honoured over another genuine TLS scheme (wss), proving the gate is
+        // on is_tls() and not the "https" string.
+        assert!(j.cookie_header(&url("wss://example.com/")).is_some());
     }
 
     #[test]
