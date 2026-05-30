@@ -7,10 +7,15 @@
 //!
 //! Scope of this implementation:
 //!
-//! - Multiplexed streams within one connection (RFC 9113 §5.1). The public
-//!   `send()` still opens one TLS session per call — connection pooling
-//!   across `send()` calls is task 5 — but a single `Connection` is now
-//!   structurally capable of carrying many concurrent streams.
+//! - Multiplexed streams within one connection (RFC 9113 §5.1). A single
+//!   `Connection` is structurally capable of carrying many concurrent
+//!   streams, and `send()` reuses a pooled `Connection` across calls: a
+//!   process-wide pool keyed on `(scheme, host, port)` parks idle
+//!   post-handshake connections so a follow-up request to the same authority
+//!   skips the TCP + TLS + h2-preface handshake and simply opens the next
+//!   odd stream id (1, 3, 5, …) on the warm connection. We drive one request
+//!   at a time over a pooled connection (sequential reuse) rather than firing
+//!   concurrent streams; the bulk of the win is amortizing the handshake.
 //! - ALPN is offered as `h2`. If the server does not select it, we still
 //!   attempt the HTTP/2 preface (a server that didn't agree will close us
 //!   or respond with a GOAWAY, which we surface as `BadResponse`).
@@ -1548,9 +1553,12 @@ impl Stream {
 /// connection-level state machine (preface, SETTINGS exchange, GOAWAY), and
 /// dispatches inbound frames to the right stream by `stream_id`.
 ///
-/// One `Connection` per TLS session. Task 5 will introduce pooling so multiple
-/// `send()` calls can reuse the same `Connection`; for now every `send()`
-/// builds a fresh one, opens a single stream, and drops it.
+/// One `Connection` per TLS session. A `Connection` outlives a single
+/// request: after a request completes cleanly and the connection is still
+/// usable ([`Connection::is_usable`]), `send()` parks it in the process-wide
+/// pool so the next `send()` to the same authority reuses it — opening the
+/// next odd stream id on the warm transport instead of re-handshaking. See
+/// the pool section near the bottom of this module.
 struct Connection<S: Read + Write> {
     tls: S,
     peer: PeerSettings,
@@ -1644,12 +1652,31 @@ impl<S: Read + Write> Connection<S> {
         true
     }
 
+    /// Drop every stream that has reached a terminal state from `self.streams`.
+    ///
+    /// `drive_until_stream_done` already removes the stream it was waiting on,
+    /// but a connection that is reused across requests could otherwise
+    /// accumulate `Closed` / fully-received entries for streams that finished
+    /// while we were blocked on another one. Reaping them here keeps the map
+    /// from growing unbounded across pooled reuses (task requirement #6) and
+    /// is a no-op for the common single-stream-per-request case.
+    fn prune_completed_streams(&mut self) {
+        self.streams.retain(|_, s| {
+            let terminal = matches!(s.state, StreamState::Closed)
+                || (matches!(s.state, StreamState::HalfClosedRemote)
+                    && s.response_headers.is_some()
+                    && s.end_stream_recv);
+            !terminal
+        });
+    }
+
     /// Allocate the next client-initiated stream id and register an empty
     /// `Stream` in `self.streams`.
     ///
     /// Errors:
     /// - At `MAX_CONCURRENT_STREAMS`: refuse so the caller can open another
-    ///   connection (task 5 will key the pool on this).
+    ///   connection. `is_usable` honours the same limit before a pooled
+    ///   connection is handed back out.
     /// - Past 2^31: stream ids are bounded by RFC 9113 §5.1.1; the caller
     ///   must discard this connection.
     /// - After a GOAWAY that names a last-stream-id below what we'd allocate:
@@ -2483,21 +2510,25 @@ pub fn send(req: Request) -> Result<Response> {
     // burn through every entry.
     if eligible {
         let pooled = {
-            let mut guard = global_pool().lock().expect("pool mutex poisoned");
+            // Poison-tolerant locking (matches the HTTP/1.1 pool and the TLS
+            // verify-posture isolation fix): a panic while another caller held
+            // the pool lock must not wedge every future request. We only ever
+            // mutate a small map under this lock, so an observer that proceeds
+            // past poison sees a structurally valid (if possibly stale) pool.
+            let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
             guard.checkout(&key)
         };
         if let Some(arc) = pooled {
             // Hold the per-conn lock for the whole request — sequential
-            // multiplexing only. The pool-wide lock has already been
-            // released.
-            let mut conn_guard = arc.lock().expect("pooled conn mutex poisoned");
+            // reuse only. The pool-wide lock has already been released.
+            let mut conn_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
             if conn_guard.is_usable() {
                 match run_one_request(&mut conn_guard, &req) {
                     Ok(resp) => {
                         let still_usable = conn_guard.is_usable();
                         drop(conn_guard);
                         if still_usable {
-                            let mut guard = global_pool().lock().expect("pool mutex poisoned");
+                            let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
                             guard.release(key.clone(), arc);
                         }
                         return Ok(resp);
@@ -2520,7 +2551,7 @@ pub fn send(req: Request) -> Result<Response> {
     let resp = run_one_request(&mut fresh, &req)?;
     if eligible && fresh.is_usable() {
         let arc = Arc::new(Mutex::new(fresh));
-        let mut guard = global_pool().lock().expect("pool mutex poisoned");
+        let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
         guard.release(key, arc);
     }
     Ok(resp)
@@ -2532,6 +2563,9 @@ fn run_one_request<S: Read + Write>(conn: &mut Connection<S>, req: &Request) -> 
     let stream_id = conn.open_stream()?;
     conn.send_request_on(stream_id, req)?;
     let stream = conn.drive_until_stream_done(stream_id)?;
+    // Reap any other streams that completed while we were driving this one, so
+    // a pooled connection's `streams` map doesn't grow across reuses.
+    conn.prune_completed_streams();
     build_response_from_stream(stream)
 }
 
@@ -4104,9 +4138,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Connection pool (task 5). All pool tests use `PoolInner::<FakeTls>`
-    // built directly — they do NOT touch the process-global `POOL` static,
-    // so they are isolated from one another and from any production code.
+    // Connection pool. All pool tests use `PoolInner::<FakeTls>` built
+    // directly — they do NOT touch the process-global `POOL` static, so they
+    // are isolated from one another and from any production code.
     // -----------------------------------------------------------------
 
     fn fake_arc_conn() -> Arc<Mutex<Connection<FakeTls>>> {
@@ -4208,6 +4242,135 @@ mod tests {
     fn connection_is_usable_true_initially() {
         let conn = fake_conn();
         assert!(conn.is_usable());
+    }
+
+    // -----------------------------------------------------------------
+    // Sequential connection reuse: run more than one request/response over a
+    // single `Connection`, exactly as the pool does on a hit. Stream ids must
+    // advance 1 → 3 → 5, response bodies must be demultiplexed correctly, the
+    // connection must stay `is_usable` between requests, and the `streams` map
+    // must be pruned back to empty after each one.
+    // -----------------------------------------------------------------
+
+    /// A complete server response for `id`: HEADERS(:status 200, END_HEADERS)
+    /// then DATA(`body`, END_STREAM).
+    fn synth_full_response(id: u32, body: &[u8]) -> Vec<Frame> {
+        vec![
+            synth_status_200_headers(id, /*end_stream=*/ false),
+            synth_data(id, body, /*end_stream=*/ true),
+        ]
+    }
+
+    fn h2_get(url: &str) -> Request {
+        Request::new("GET", url).unwrap()
+    }
+
+    #[test]
+    fn sequential_reuse_advances_stream_ids_and_demuxes_bodies() {
+        // Pre-seed three full responses on streams 1, 3, 5 — the ids the
+        // client must allocate across three sequential requests on one conn.
+        let mut inbound = Vec::new();
+        inbound.extend(synth_full_response(1, b"first"));
+        inbound.extend(synth_full_response(3, b"second"));
+        inbound.extend(synth_full_response(5, b"third"));
+        let mut conn = fake_conn_with_inbound(&inbound);
+
+        let req = h2_get("https://example.com/");
+
+        // Request #1 → stream 1.
+        assert_eq!(conn.next_stream_id, 1);
+        let r1 = run_one_request(&mut conn, &req).unwrap();
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.body, b"first");
+        // Stream pruned, conn ready for the next id, still poolable.
+        assert!(conn.streams.is_empty(), "stream 1 not reaped after reuse");
+        assert_eq!(conn.next_stream_id, 3);
+        assert!(conn.is_usable());
+
+        // Request #2 → stream 3.
+        let r2 = run_one_request(&mut conn, &req).unwrap();
+        assert_eq!(r2.status, 200);
+        assert_eq!(r2.body, b"second");
+        assert!(conn.streams.is_empty());
+        assert_eq!(conn.next_stream_id, 5);
+        assert!(conn.is_usable());
+
+        // Request #3 → stream 5.
+        let r3 = run_one_request(&mut conn, &req).unwrap();
+        assert_eq!(r3.body, b"third");
+        assert_eq!(conn.next_stream_id, 7);
+        assert!(conn.is_usable());
+
+        // Confirm the HEADERS the client actually wrote carried stream ids
+        // 1, 3, 5 in order — i.e. id progression went out on the wire, not
+        // just in the local counter.
+        let header_ids: Vec<u32> = drain_wire_out(&conn)
+            .into_iter()
+            .filter(|f| f.typ == F_HEADERS)
+            .map(|f| f.stream_id)
+            .collect();
+        assert_eq!(header_ids, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn goaway_between_requests_marks_connection_non_reusable() {
+        // First request succeeds; the peer then sends GOAWAY (last-stream-id
+        // = 1) before we issue a second. is_usable must flip to false so the
+        // pool drops the connection instead of handing it back out.
+        let mut inbound = Vec::new();
+        inbound.extend(synth_full_response(1, b"ok"));
+        // GOAWAY(last_stream_id=1, NO_ERROR) on stream 0.
+        let mut goaway_payload = Vec::new();
+        goaway_payload.extend_from_slice(&1u32.to_be_bytes()); // last-stream-id
+        goaway_payload.extend_from_slice(&0u32.to_be_bytes()); // error code
+        inbound.push(Frame {
+            typ: F_GOAWAY,
+            flags: 0,
+            stream_id: 0,
+            payload: goaway_payload,
+        });
+        let mut conn = fake_conn_with_inbound(&inbound);
+
+        let req = h2_get("https://example.com/");
+        let r1 = run_one_request(&mut conn, &req).unwrap();
+        assert_eq!(r1.body, b"ok");
+        assert!(conn.is_usable(), "no GOAWAY seen yet — still reusable");
+
+        // Consume the GOAWAY that's sitting in the inbound buffer.
+        let outcome = conn.read_and_dispatch().unwrap();
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(conn.goaway_received, Some(1));
+        assert!(
+            !conn.is_usable(),
+            "GOAWAY must make the connection non-reusable"
+        );
+    }
+
+    #[test]
+    fn prune_completed_streams_drops_terminal_entries_only() {
+        // A connection that finished one stream while another is still open
+        // must keep the open one and reap the closed one.
+        let mut conn = fake_conn();
+        let open_id = conn.open_stream().unwrap();
+        let done_id = conn.open_stream().unwrap();
+        // Mark `done_id` fully received and closed; leave `open_id` mid-flight.
+        {
+            let s = conn.streams.get_mut(&done_id).unwrap();
+            s.state = StreamState::Closed;
+            s.response_headers = Some(vec![(":status".into(), "200".into())]);
+            s.end_stream_recv = true;
+        }
+        conn.streams.get_mut(&open_id).unwrap().state = StreamState::Open;
+
+        conn.prune_completed_streams();
+        assert!(
+            conn.streams.contains_key(&open_id),
+            "open stream was reaped"
+        );
+        assert!(
+            !conn.streams.contains_key(&done_id),
+            "closed stream was not reaped"
+        );
     }
 
     #[test]
