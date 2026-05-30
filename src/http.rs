@@ -497,7 +497,7 @@ fn finalize_plain(
     if may_pool && response_is_reusable(&req.method, resp) {
         crate::pool::plain()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .release(pool_key_for(&req.url), bufrd);
         let _ = writeln!(trace, "* Connection kept alive (pooled)");
     } else {
@@ -544,15 +544,27 @@ pub(crate) fn pool_key_for(u: &Url) -> crate::pool::Key {
 fn pool_checkout_plain(u: &Url) -> Option<BufReader<TcpStream>> {
     crate::pool::plain()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .checkout(&pool_key_for(u))
 }
 
-fn pool_checkout_tls(u: &Url) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
+/// True iff this request's TLS posture matches what a pooled socket can be
+/// safely shared with. A connection made with verification off (`-k`) or
+/// against a custom CA bundle (`--cacert`) must NEVER be handed to a later
+/// verifying request to the same host:port — that would silently downgrade
+/// the second request's trust decision (MITM). Mirrors `http2::pool_eligible`.
+pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
+    req.verify_tls && req.ca_bundle.is_none()
+}
+
+fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
+    if !tls_pool_eligible(req) {
+        return None;
+    }
     crate::pool::tls()
         .lock()
-        .unwrap()
-        .checkout(&pool_key_for(u))
+        .unwrap_or_else(|e| e.into_inner())
+        .checkout(&pool_key_for(&req.url))
 }
 
 /// Server-side keep-alive eligibility. Caller must also have read the body
@@ -702,7 +714,7 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // (those would have been satisfied by the h2 attempt above).
     let direct = req.proxy.is_none() || proxy_bypassed(&req);
     if direct {
-        if let Some(bufrd) = pool_checkout_tls(&req.url) {
+        if let Some(bufrd) = pool_checkout_tls(&req) {
             let _ = writeln!(trace, "* Reusing existing connection from pool");
             match perform_on_pooled_tls(bufrd, &req, trace) {
                 Ok(resp) => return Ok(resp),
@@ -765,10 +777,13 @@ fn finalize_tls(
     may_pool: bool,
     trace: &mut dyn Write,
 ) {
-    if may_pool && response_is_reusable(&req.method, resp) {
+    // Only park sockets whose verification posture matches a default
+    // verifying request — never an `-k`/`--cacert` socket — so a later
+    // verifying request can't silently inherit a weaker trust decision.
+    if may_pool && tls_pool_eligible(req) && response_is_reusable(&req.method, resp) {
         crate::pool::tls()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .release(pool_key_for(&req.url), bufrd);
         let _ = writeln!(trace, "* Connection kept alive (pooled)");
     } else {
@@ -969,12 +984,75 @@ fn write_tls_info<S: Read + Write>(tls: &crate::tls::TlsStream<S>, trace: &mut d
     }
 }
 
+/// True if `name` is a valid HTTP field-name per RFC 7230 `token`: one or more
+/// of the `tchar` set (no separators, no controls, no whitespace).
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// True if `value` carries a byte that would forge a header boundary or NUL.
+/// CR and LF anywhere in a value let an attacker splice extra header lines.
+fn header_value_has_forbidden(value: &str) -> bool {
+    value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
+/// Reject a `(name, value)` pair that could not be safely serialised onto the
+/// wire — a name outside the RFC 7230 token set, or a name/value carrying
+/// CR, LF, or NUL.
+fn validate_header(name: &str, value: &str) -> Result<()> {
+    if !is_valid_header_name(name) {
+        return Err(Error::BadResponse(format!("invalid header name: {name:?}")));
+    }
+    if header_value_has_forbidden(value) {
+        return Err(Error::BadResponse(format!(
+            "invalid header value for {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a request method that carries CR, LF, a space, or any control char —
+/// any of which would corrupt the request line / forge an extra line.
+fn validate_method(method: &str) -> Result<()> {
+    if method.is_empty() || method.bytes().any(|b| b < 0x20 || b == 0x7f || b == b' ') {
+        return Err(Error::BadResponse(format!("invalid method: {method:?}")));
+    }
+    Ok(())
+}
+
 fn write_request<W: Write>(
     mut w: W,
     req: &Request,
     absolute_form: bool,
     trace: &mut dyn Write,
 ) -> Result<()> {
+    // Validate everything that lands on the request line / header block before
+    // emitting a single byte, so nothing carrying CR/LF can reach the socket.
+    validate_method(&req.method)?;
+    for (k, v) in &req.headers {
+        validate_header(k, v)?;
+    }
+
     let host_header = if (req.url.scheme == "http" && req.url.port == 80)
         || (req.url.scheme == "https" && req.url.port == 443)
     {
@@ -1200,6 +1278,37 @@ fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
     Ok((version, status, reason))
 }
 
+/// Resolve the effective `Content-Length` from the header set, rejecting
+/// smuggling-friendly ambiguity per RFC 9112 §6.3. Multiple `Content-Length`
+/// header lines — or a single line that is itself a comma list — are only
+/// acceptable if every value parses and they all agree; any disagreement (or
+/// an unparseable value) is a hard error. Returns `None` when no
+/// `Content-Length` is present.
+fn parse_content_length(headers: &[(String, String)]) -> Result<Option<u64>> {
+    let mut seen: Option<u64> = None;
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        // A value may be a comma list (`5, 5`); split and validate each part.
+        for part in v.split(',') {
+            let n: u64 = part
+                .trim()
+                .parse()
+                .map_err(|_| Error::BadResponse(format!("bad Content-Length: {v:?}")))?;
+            match seen {
+                Some(prev) if prev != n => {
+                    return Err(Error::BadResponse(
+                        "conflicting Content-Length values".into(),
+                    ));
+                }
+                _ => seen = Some(n),
+            }
+        }
+    }
+    Ok(seen)
+}
+
 fn read_body<R: BufRead>(
     r: &mut R,
     headers: &[(String, String)],
@@ -1216,6 +1325,23 @@ fn read_body<R: BufRead>(
         return Ok(Vec::new());
     }
 
+    // RFC 9112 §6.1: `Transfer-Encoding` present means the message is framed by
+    // the transfer coding, and a `Content-Length` alongside it is a smuggling
+    // vector (the two framings can disagree). Reject the message rather than
+    // pick a side. We only know how to decode `chunked`, so any other coding is
+    // its own error below.
+    let has_te = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    let has_cl = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if has_te && has_cl {
+        return Err(Error::BadResponse(
+            "both Transfer-Encoding and Content-Length present".into(),
+        ));
+    }
+
     let chunked = headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
     });
@@ -1223,15 +1349,15 @@ fn read_body<R: BufRead>(
         return read_chunked(r);
     }
 
-    let content_length = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let content_length = parse_content_length(headers)?;
 
     let mut body = Vec::new();
     match content_length {
         Some(len) => {
-            if len as usize > MAX_BODY_BYTES {
+            // Compare against the cap as `u64` *before* any `as usize` cast, so
+            // a value that wraps to a small `usize` on a 32-bit target can't
+            // slip past the guard.
+            if len > MAX_BODY_BYTES as u64 {
                 return Err(Error::BadResponse(format!("body too large: {len}")));
             }
             body.reserve(len as usize);
@@ -1311,6 +1437,143 @@ mod tests {
     #[test]
     fn rejects_non_http() {
         assert!(parse_status_line("RTSP/1.0 200 OK").is_err());
+    }
+
+    #[test]
+    fn header_name_token_validation() {
+        assert!(is_valid_header_name("X-Custom-Header"));
+        assert!(is_valid_header_name("Content-Type"));
+        assert!(!is_valid_header_name(""));
+        assert!(!is_valid_header_name("Bad Name")); // space
+        assert!(!is_valid_header_name("Bad:Name")); // colon is a separator
+        assert!(!is_valid_header_name("Bad\r\nName"));
+    }
+
+    #[test]
+    fn validate_header_rejects_crlf_in_value() {
+        assert!(validate_header("X", "ok").is_ok());
+        assert!(validate_header("X", "evil\r\nInjected: 1").is_err());
+        assert!(validate_header("X", "evil\rstuff").is_err());
+        assert!(validate_header("X", "evil\nstuff").is_err());
+        assert!(validate_header("X", "evil\0stuff").is_err());
+    }
+
+    #[test]
+    fn validate_method_rejects_control_and_space() {
+        assert!(validate_method("GET").is_ok());
+        assert!(validate_method("PROPFIND").is_ok());
+        assert!(validate_method("").is_err());
+        assert!(validate_method("GET HTTP/1.1\r\nEvil:").is_err());
+        assert!(validate_method("BAD\r\n").is_err());
+        assert!(validate_method("BAD METHOD").is_err());
+    }
+
+    #[test]
+    fn write_request_refuses_injected_header() {
+        // Nothing carrying CR/LF must ever reach the socket: write_request
+        // returns an error before emitting a byte.
+        let mut req = Request::get("http://example.com/").unwrap();
+        req.headers
+            .push(("X-Evil".into(), "a\r\nInjected: 1".into()));
+        let mut sink = Vec::new();
+        let mut trace = Vec::new();
+        let err = write_request(&mut sink, &req, false, &mut trace).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+        assert!(sink.is_empty(), "nothing should have been written");
+    }
+
+    #[test]
+    fn write_request_refuses_injected_method() {
+        let mut req = Request::get("http://example.com/").unwrap();
+        req.method = "GET\r\nEvil: 1".into();
+        let mut sink = Vec::new();
+        let mut trace = Vec::new();
+        assert!(write_request(&mut sink, &req, false, &mut trace).is_err());
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn tls_pool_eligible_only_for_default_posture() {
+        let mut req = Request::get("https://example.com/").unwrap();
+        assert!(tls_pool_eligible(&req)); // verify on, no custom CA
+        req.verify_tls = false;
+        assert!(!tls_pool_eligible(&req)); // -k
+        req.verify_tls = true;
+        req.ca_bundle = Some("/tmp/ca.pem".into());
+        assert!(!tls_pool_eligible(&req)); // --cacert
+    }
+
+    #[test]
+    fn content_length_single_ok() {
+        let h = vec![("Content-Length".to_string(), "42".to_string())];
+        assert_eq!(parse_content_length(&h).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn content_length_absent_is_none() {
+        let h = vec![("X".to_string(), "y".to_string())];
+        assert_eq!(parse_content_length(&h).unwrap(), None);
+    }
+
+    #[test]
+    fn content_length_duplicate_agreeing_ok() {
+        let h = vec![
+            ("Content-Length".to_string(), "5".to_string()),
+            ("content-length".to_string(), "5".to_string()),
+        ];
+        assert_eq!(parse_content_length(&h).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn content_length_conflicting_rejected() {
+        let h = vec![
+            ("Content-Length".to_string(), "5".to_string()),
+            ("Content-Length".to_string(), "6".to_string()),
+        ];
+        assert!(parse_content_length(&h).is_err());
+    }
+
+    #[test]
+    fn content_length_comma_list_conflicting_rejected() {
+        let h = vec![("Content-Length".to_string(), "5, 6".to_string())];
+        assert!(parse_content_length(&h).is_err());
+    }
+
+    #[test]
+    fn content_length_comma_list_agreeing_ok() {
+        let h = vec![("Content-Length".to_string(), "5, 5".to_string())];
+        assert_eq!(parse_content_length(&h).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn content_length_unparseable_rejected() {
+        let h = vec![("Content-Length".to_string(), "not-a-number".to_string())];
+        assert!(parse_content_length(&h).is_err());
+    }
+
+    #[test]
+    fn read_body_rejects_te_and_cl_together() {
+        use std::io::Cursor;
+        // A response advertising both chunked TE and a Content-Length is a
+        // smuggling vector and must be rejected outright.
+        let headers = vec![
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Content-Length".to_string(), "5".to_string()),
+        ];
+        let mut r = BufReader::new(Cursor::new(b"0\r\n\r\n".to_vec()));
+        let err = read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn read_body_rejects_conflicting_content_length() {
+        use std::io::Cursor;
+        let headers = vec![
+            ("Content-Length".to_string(), "3".to_string()),
+            ("Content-Length".to_string(), "4".to_string()),
+        ];
+        let mut r = BufReader::new(Cursor::new(b"abcd".to_vec()));
+        assert!(read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").is_err());
     }
 
     #[test]
