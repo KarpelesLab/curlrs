@@ -70,20 +70,62 @@ impl Url {
             None => (None, authority),
         };
 
-        let (host, port) = match hostport.rfind(':') {
-            Some(i) if !hostport[..i].contains(']') => {
-                let h = &hostport[..i];
-                let p: u16 = hostport[i + 1..]
-                    .parse()
-                    .map_err(|_| Error::InvalidUrl(s.to_string()))?;
-                (h, p)
+        // Split host from an optional `:port`. IPv6 literals are bracketed
+        // (`[::1]`) so a `:` inside the brackets is not a port separator; only
+        // a `:` *after* the closing `]` is. A bare `[` with no matching `]` is
+        // a malformed authority and is rejected. The brackets are retained in
+        // the stored `host` because every transport/`Host:`-header construction
+        // in the crate concatenates `host` directly and an IPv6 literal needs
+        // them to remain unambiguous.
+        let (host, port) = if let Some(close) = hostport.find(']') {
+            if !hostport.starts_with('[') {
+                return Err(Error::InvalidUrl(s.to_string()));
             }
-            _ => (hostport, default_port),
+            // Authority after the `]` is either empty or `:port`.
+            let after = &hostport[close + 1..];
+            let port = if after.is_empty() {
+                default_port
+            } else if let Some(p) = after.strip_prefix(':') {
+                p.parse().map_err(|_| Error::InvalidUrl(s.to_string()))?
+            } else {
+                return Err(Error::InvalidUrl(s.to_string()));
+            };
+            (&hostport[..=close], port)
+        } else if hostport.starts_with('[') {
+            // Opening bracket with no closing one — unterminated IPv6 literal.
+            return Err(Error::InvalidUrl(s.to_string()));
+        } else {
+            match hostport.rfind(':') {
+                Some(i) => {
+                    let h = &hostport[..i];
+                    let p: u16 = hostport[i + 1..]
+                        .parse()
+                        .map_err(|_| Error::InvalidUrl(s.to_string()))?;
+                    (h, p)
+                }
+                None => (hostport, default_port),
+            }
         };
 
         if host.is_empty() {
             return Err(Error::InvalidUrl(s.to_string()));
         }
+
+        // Port 0 is the kernel's "pick any" sentinel — never a real
+        // destination — so reject it rather than silently dialling it.
+        if port == 0 {
+            return Err(Error::InvalidUrl(s.to_string()));
+        }
+
+        // The host, userinfo, and path are written verbatim into the request
+        // line and the `Host:` header. A control char, DEL, or raw space in any
+        // of them would let an attacker splice in extra header lines (CRLF
+        // injection / request smuggling), so reject them outright.
+        reject_forbidden(host, s)?;
+        if let Some(info) = &userinfo {
+            reject_forbidden(info, s)?;
+        }
+        reject_forbidden(path, s)?;
 
         Ok(Url {
             scheme,
@@ -165,6 +207,17 @@ pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
     };
     let composed = format!("{}://{}{}{}", base.scheme, authority, dir, loc_no_frag);
     Url::parse(&composed)
+}
+
+/// Reject any field destined for the request line / `Host:` header that
+/// carries a byte capable of forging a header boundary or otherwise corrupting
+/// the wire framing: ASCII control chars (`< 0x20`, which includes CR and LF),
+/// DEL (`0x7f`), and a raw space.
+fn reject_forbidden(field: &str, original: &str) -> Result<()> {
+    if field.bytes().any(|b| b < 0x20 || b == 0x7f || b == b' ') {
+        return Err(Error::InvalidUrl(original.to_string()));
+    }
+    Ok(())
 }
 
 /// Default port for every scheme rsurl knows about. Returning `None` means
@@ -323,6 +376,74 @@ mod tests {
     fn resolve_rejects_empty() {
         let base = Url::parse("http://a.example/").unwrap();
         assert!(resolve(&base, "").is_err());
+    }
+
+    #[test]
+    fn parses_ipv6_literal_with_port() {
+        let u = Url::parse("http://[::1]:8080/x").unwrap();
+        assert_eq!(u.host, "[::1]");
+        assert_eq!(u.port, 8080);
+        assert_eq!(u.path, "/x");
+    }
+
+    #[test]
+    fn parses_ipv6_literal_default_port() {
+        let u = Url::parse("http://[::1]/x").unwrap();
+        assert_eq!(u.host, "[::1]");
+        assert_eq!(u.port, 80);
+    }
+
+    #[test]
+    fn rejects_unterminated_ipv6_literal() {
+        assert!(Url::parse("http://[::1/x").is_err());
+        assert!(Url::parse("http://[::1").is_err());
+    }
+
+    #[test]
+    fn rejects_bracket_without_leading_bracket() {
+        // `a]b:80` — a stray `]` with no opening bracket is malformed.
+        assert!(Url::parse("http://a]b:80/x").is_err());
+    }
+
+    #[test]
+    fn rejects_port_zero() {
+        assert!(Url::parse("http://example.com:0/").is_err());
+        assert!(Url::parse("http://[::1]:0/").is_err());
+    }
+
+    #[test]
+    fn rejects_control_char_in_host() {
+        // Raw CR/LF or other control bytes in the host would let a crafted URL
+        // splice extra header lines into the request.
+        assert!(Url::parse("http://exa\rmple.com/").is_err());
+        assert!(Url::parse("http://exa\nmple.com/").is_err());
+        assert!(Url::parse("http://exa\x00mple.com/").is_err());
+    }
+
+    #[test]
+    fn rejects_space_in_host() {
+        assert!(Url::parse("http://exa mple.com/").is_err());
+    }
+
+    #[test]
+    fn rejects_control_char_in_path() {
+        assert!(Url::parse("http://example.com/foo\r\nX: y").is_err());
+        assert!(Url::parse("http://example.com/foo bar").is_err());
+        assert!(Url::parse("http://example.com/foo\x7f").is_err());
+    }
+
+    #[test]
+    fn rejects_control_char_in_userinfo() {
+        assert!(Url::parse("http://us\rer:pass@example.com/").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_injected_location() {
+        // A `Location:` value carrying a control char must be rejected when it
+        // is reparsed, closing the redirect-borne injection path.
+        let base = Url::parse("http://a.example/").unwrap();
+        assert!(resolve(&base, "http://evil\r\nX: y/").is_err());
+        assert!(resolve(&base, "/foo\r\nX: y").is_err());
     }
 
     #[test]
