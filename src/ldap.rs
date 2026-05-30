@@ -419,6 +419,11 @@ enum Filter {
     },
 }
 
+/// Maximum nesting depth of `&`/`|`/`!` filter groups. Bounds parser
+/// recursion so a maliciously deep filter (e.g. `(!(!(!...)))`) cannot
+/// overflow the native stack.
+const MAX_FILTER_DEPTH: usize = 64;
+
 struct FilterParser<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -456,22 +461,25 @@ impl<'a> FilterParser<'a> {
         }
     }
 
-    fn parse(&mut self) -> Result<Filter> {
+    fn parse(&mut self, depth: usize) -> Result<Filter> {
+        if depth > MAX_FILTER_DEPTH {
+            return Err(Error::BadResponse("ldap: filter nesting too deep".into()));
+        }
         self.expect(b'(')?;
         let f = match self.peek() {
             Some(b'&') => {
                 self.bump();
-                let items = self.parse_list()?;
+                let items = self.parse_list(depth + 1)?;
                 Filter::And(items)
             }
             Some(b'|') => {
                 self.bump();
-                let items = self.parse_list()?;
+                let items = self.parse_list(depth + 1)?;
                 Filter::Or(items)
             }
             Some(b'!') => {
                 self.bump();
-                let inner = self.parse()?;
+                let inner = self.parse(depth + 1)?;
                 Filter::Not(Box::new(inner))
             }
             Some(_) => self.parse_simple()?,
@@ -481,10 +489,10 @@ impl<'a> FilterParser<'a> {
         Ok(f)
     }
 
-    fn parse_list(&mut self) -> Result<Vec<Filter>> {
+    fn parse_list(&mut self, depth: usize) -> Result<Vec<Filter>> {
         let mut out = Vec::new();
         while self.peek() == Some(b'(') {
-            out.push(self.parse()?);
+            out.push(self.parse(depth)?);
         }
         if out.is_empty() {
             return Err(Error::BadResponse("filter: empty list".into()));
@@ -680,7 +688,7 @@ impl<'a> FilterParser<'a> {
 
 fn parse_filter(s: &str) -> Result<Filter> {
     let mut p = FilterParser::new(s);
-    let f = p.parse()?;
+    let f = p.parse(0)?;
     if p.pos != p.bytes.len() {
         return Err(Error::BadResponse("filter: trailing garbage".into()));
     }
@@ -1356,6 +1364,38 @@ mod tests {
             }
             other => panic!("expected Or, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_filter_rejects_excessive_nesting() {
+        // Build a filter nested far deeper than MAX_FILTER_DEPTH. This must
+        // return an Err rather than overflowing the native stack.
+        let depth = MAX_FILTER_DEPTH + 1000;
+        let mut s = String::with_capacity(depth * 2 + 8);
+        for _ in 0..depth {
+            s.push_str("(!");
+        }
+        s.push_str("(cn=a)");
+        for _ in 0..depth {
+            s.push(')');
+        }
+        let err = parse_filter(&s).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+
+        // A filter nested just under the limit still parses fine.
+        let ok_depth = MAX_FILTER_DEPTH - 1;
+        let mut ok = String::new();
+        for _ in 0..ok_depth {
+            ok.push_str("(!");
+        }
+        ok.push_str("(cn=a)");
+        for _ in 0..ok_depth {
+            ok.push(')');
+        }
+        assert!(parse_filter(&ok).is_ok());
+
+        // And an ordinary shallow filter is unaffected.
+        assert!(parse_filter("(|(cn=a)(!(cn=b)))").is_ok());
     }
 
     #[test]
