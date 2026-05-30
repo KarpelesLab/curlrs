@@ -64,6 +64,7 @@
 //! [`on_timeout`]: purecrypto::quic::QuicConnection::on_timeout
 
 use std::io;
+use std::io::Write;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -1432,7 +1433,7 @@ impl Http3State {
     }
 }
 
-pub fn send(req: Request) -> Result<Response> {
+pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
     if req.url.scheme != "https" {
         // HTTP/3 only runs over QUIC, which only runs encrypted.
         return Err(Error::UnsupportedScheme(format!(
@@ -1443,7 +1444,24 @@ pub fn send(req: Request) -> Result<Response> {
 
     let mut conn = build_client(&req)?;
     let (sock, peer) = open_udp(&req)?;
+    let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
     handshake(&mut conn, &sock, peer, req.read_timeout)?;
+    let _ = writeln!(
+        trace,
+        "* Connected to {} ({}) port {} (QUIC)",
+        req.url.host,
+        peer.ip(),
+        peer.port()
+    );
+    // QUIC carries its own TLS 1.3 handshake inside the transport, so the
+    // `crate::tls::TlsStream` accessors used by `write_tls_info` (negotiated
+    // version, ALPN, peer certificate chain) don't apply to a `QuicConnection`
+    // — purecrypto 0.2 exposes no public accessor for them. Emit the minimal
+    // equivalent: ALPN is "h3" by construction (we only offer that), and the
+    // handshake completing means the cert chain verified.
+    let _ = writeln!(trace, "* QUIC connected, TLS 1.3 handshake complete");
+    let _ = writeln!(trace, "* ALPN: server accepted h3");
+    let _ = writeln!(trace, "* using HTTP/3");
 
     // RFC 9114 §6.2.1 — open a unidirectional control stream and send
     // SETTINGS. Without it the peer is allowed to close us with
@@ -1464,10 +1482,21 @@ pub fn send(req: Request) -> Result<Response> {
         .open_bidi()
         .map_err(|e| Error::BadResponse(format!("http3: open_bidi failed: {e:?}")))?;
 
-    write_request(&mut conn, request_stream, &req)?;
+    write_request(&mut conn, request_stream, &req, trace)?;
+    if !req.body.is_empty() {
+        let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
+    }
     pump(&mut conn, &sock, peer, req.read_timeout)?;
 
-    read_response(&mut conn, &sock, peer, request_stream, &req, &mut state)
+    read_response(
+        &mut conn,
+        &sock,
+        peer,
+        request_stream,
+        &req,
+        &mut state,
+        trace,
+    )
 }
 
 /// Read all readable server-initiated unidirectional streams, classify each
@@ -1766,7 +1795,12 @@ fn write_all(conn: &mut QuicConnection, sid: StreamId, mut data: &[u8]) -> Resul
 }
 
 /// Serialize HEADERS + DATA for `req` onto `sid` and finish the send side.
-fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Result<()> {
+fn write_request(
+    conn: &mut QuicConnection,
+    sid: StreamId,
+    req: &Request,
+    trace: &mut dyn Write,
+) -> Result<()> {
     // Build the pseudo-headers required by RFC 9114 §4.3.1.
     let host_port = if req.url.port == 443 {
         req.url.host.clone()
@@ -1819,6 +1853,29 @@ fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Res
         fields.push(("content-length".into(), req.body.len().to_string()));
     }
 
+    // Verbose `>` request trace, mirroring HTTP/1.1 + HTTP/2: a request line
+    // built from the `:method`/`:path` pseudo-headers, a `Host:` line from
+    // `:authority`, then every regular field actually sent, then a closing
+    // blank `> `. Read straight from `fields` so the trace can't drift from
+    // the encoded HEADERS block.
+    {
+        let path = fields
+            .iter()
+            .find(|(k, _)| k == ":path")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("/");
+        let _ = writeln!(trace, "> {} {path} HTTP/3", req.method);
+        if let Some((_, authority)) = fields.iter().find(|(k, _)| k == ":authority") {
+            let _ = writeln!(trace, "> Host: {authority}");
+        }
+        for (k, v) in &fields {
+            if !k.starts_with(':') {
+                let _ = writeln!(trace, "> {k}: {v}");
+            }
+        }
+        let _ = writeln!(trace, "> ");
+    }
+
     let qpack_payload = qpack::encode_field_section(&fields);
 
     let mut out = Vec::with_capacity(qpack_payload.len() + 16);
@@ -1859,6 +1916,7 @@ fn read_response(
     sid: StreamId,
     req: &Request,
     state: &mut Http3State,
+    trace: &mut dyn Write,
 ) -> Result<Response> {
     let total_deadline = req
         .read_timeout
@@ -1932,7 +1990,7 @@ fn read_response(
     }
 
     let fields = headers.ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
-    finalize_response(fields, body)
+    finalize_response(fields, body, trace)
 }
 
 enum FrameOutcome {
@@ -2018,7 +2076,11 @@ fn send_section_ack(conn: &mut QuicConnection, request_sid: StreamId, state: &Ht
     }
 }
 
-fn finalize_response(fields: qpack::Fields, body: Vec<u8>) -> Result<Response> {
+fn finalize_response(
+    fields: qpack::Fields,
+    body: Vec<u8>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let mut status: Option<u16> = None;
     let mut hdrs: Vec<(String, String)> = Vec::with_capacity(fields.len());
     for (k, v) in fields {
@@ -2036,9 +2098,20 @@ fn finalize_response(fields: qpack::Fields, body: Vec<u8>) -> Result<Response> {
         }
     }
     let status = status.ok_or_else(|| Error::BadResponse("http3: missing :status".into()))?;
+
+    // Response `<` trace, mirroring HTTP/1.1 + HTTP/2: a status line carrying
+    // the HTTP/3 version + numeric status, then each header field, then a
+    // closing blank `< `, then the body-byte notice.
+    let _ = writeln!(trace, "< HTTP/3 {status}");
+    for (k, v) in &hdrs {
+        let _ = writeln!(trace, "< {k}: {v}");
+    }
+    let _ = writeln!(trace, "< ");
+    let _ = writeln!(trace, "* Received {} body bytes", body.len());
+
     // Shared with HTTP/1.1 and HTTP/2: strip any Content-Encoding layer we
     // recognise (gzip / deflate / x-gzip / identity).
-    let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, &mut std::io::sink())?;
+    let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, trace)?;
     Ok(Response {
         status,
         // HTTP/3 has no reason phrase on the wire.
@@ -2338,7 +2411,7 @@ mod tests {
     #[test]
     fn send_rejects_non_https() {
         let req = Request::get("http://example.com/").unwrap();
-        let err = send(req).unwrap_err();
+        let err = send(req, &mut std::io::sink()).unwrap_err();
         match err {
             Error::UnsupportedScheme(_) => {}
             other => panic!("expected UnsupportedScheme, got {other:?}"),

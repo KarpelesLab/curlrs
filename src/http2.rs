@@ -1352,36 +1352,6 @@ impl Encoder {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// TCP setup, mirroring crate::http::tcp_connect.
-// ---------------------------------------------------------------------------
-
-fn tcp_connect(req: &Request) -> Result<TcpStream> {
-    // Route through the proxy when one is configured and the target host
-    // isn't bypassed. Symmetric to `crate::http::tcp_connect`.
-    let proxy = req
-        .proxy
-        .as_ref()
-        .filter(|_| !crate::http::proxy_bypassed(req));
-    let (target_host, target_port) = match proxy {
-        Some(p) => (p.host.as_str(), p.port),
-        None => (req.url.host.as_str(), req.url.port),
-    };
-    let addr = format!("{target_host}:{target_port}");
-    let stream = match req.connect_timeout {
-        Some(t) => {
-            let first = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
-                .next()
-                .ok_or_else(|| Error::InvalidUrl(target_host.to_string()))?;
-            TcpStream::connect_timeout(&first, t)?
-        }
-        None => TcpStream::connect(&addr)?,
-    };
-    stream.set_read_timeout(req.read_timeout)?;
-    stream.set_write_timeout(req.read_timeout)?;
-    Ok(stream)
-}
-
-// ---------------------------------------------------------------------------
 // Per-stream state machine (RFC 9113 §5.1) and the `Stream` it lives on.
 // ---------------------------------------------------------------------------
 
@@ -2445,8 +2415,10 @@ fn global_pool() -> &'static Mutex<PoolInner<TlsStream<TcpStream>>> {
 /// Build a brand-new HTTP/2 connection: TCP → TLS (ALPN=h2) → preface.
 /// Used both by `send()` on a cold path and indirectly by anything that
 /// wants a fresh `Connection` (currently no other call sites).
-fn dial_h2(req: &Request) -> Result<Connection<TlsStream<TcpStream>>> {
-    let tcp = tcp_connect(req)?;
+fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<Connection<TlsStream<TcpStream>>> {
+    // Reuse the shared TCP dialer so the `*   Trying ...` / `* Connected to ...`
+    // trace lines and the actual socket come from the same code as HTTP/1.1.
+    let tcp = crate::http::tcp_connect(req, trace)?;
     // HTTPS-over-proxy: CONNECT to establish a transparent tunnel before
     // the TLS handshake. h2c (cleartext HTTP/2) over a proxy is rejected
     // higher up in `send()`, so by here we know scheme == "https".
@@ -2455,17 +2427,18 @@ fn dial_h2(req: &Request) -> Result<Connection<TlsStream<TcpStream>>> {
         .as_ref()
         .filter(|_| !crate::http::proxy_bypassed(req))
     {
-        // No trace plumbing here yet — this path runs from `send()` which
-        // doesn't carry one. The handshake error (if any) bubbles up the
-        // call stack with enough context.
-        crate::http::connect_tunnel(&tcp, &req.url, p, &mut std::io::sink())?;
+        crate::http::connect_tunnel(&tcp, &req.url, p, trace)?;
     }
     let opts = crate::http::tls_opts_from(req, &[b"h2"])?;
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    crate::http::write_tls_info(&tls, trace);
     let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
     if !negotiated_h2 {
+        // Bail before emitting any request `>` lines — the caller (Auto mode)
+        // will fall back to HTTP/1.1 on a fresh connection.
         return Err(Error::H2NotNegotiated);
     }
+    let _ = writeln!(trace, "* using HTTP/2");
     Connection::new(tls)
 }
 
@@ -2489,7 +2462,7 @@ fn pool_eligible(req: &Request) -> bool {
 ///    inconsistent — mid-frame, mid-CONTINUATION — and we cannot recover).
 /// 3. On a pool miss, dial a fresh conn, run the request, and release on
 ///    success.
-pub fn send(req: Request) -> Result<Response> {
+pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
     if req.url.scheme != "https" {
         // h2c (cleartext HTTP/2 with upgrade) is out of scope for v1.
         return Err(Error::UnsupportedScheme(format!(
@@ -2523,13 +2496,17 @@ pub fn send(req: Request) -> Result<Response> {
             // reuse only. The pool-wide lock has already been released.
             let mut conn_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
             if conn_guard.is_usable() {
-                match run_one_request(&mut conn_guard, &req) {
+                let _ = writeln!(trace, "* Reusing existing connection from pool");
+                match run_one_request(&mut conn_guard, &req, trace) {
                     Ok(resp) => {
                         let still_usable = conn_guard.is_usable();
                         drop(conn_guard);
                         if still_usable {
                             let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
                             guard.release(key.clone(), arc);
+                            let _ = writeln!(trace, "* Connection kept alive (pooled)");
+                        } else {
+                            let _ = writeln!(trace, "* Connection closed");
                         }
                         return Ok(resp);
                     }
@@ -2539,41 +2516,63 @@ pub fn send(req: Request) -> Result<Response> {
                         // is intentionally discarded in favour of the
                         // (likely cleaner) error from the fresh attempt.
                         drop(conn_guard);
+                        let _ = writeln!(
+                            trace,
+                            "* Pooled connection unusable (request failed); reconnecting"
+                        );
                     }
                 }
+            } else {
+                // Unusable on checkout: just drop, do not re-pool.
+                let _ = writeln!(
+                    trace,
+                    "* Pooled connection unusable (connection closed); reconnecting"
+                );
             }
-            // Unusable on checkout: just drop, do not re-pool.
         }
     }
 
     // -------- Cold-dial path --------
-    let mut fresh = dial_h2(&req)?;
-    let resp = run_one_request(&mut fresh, &req)?;
+    let mut fresh = dial_h2(&req, trace)?;
+    let resp = run_one_request(&mut fresh, &req, trace)?;
     if eligible && fresh.is_usable() {
         let arc = Arc::new(Mutex::new(fresh));
         let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
         guard.release(key, arc);
+        let _ = writeln!(trace, "* Connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
     }
     Ok(resp)
 }
 
 /// Drive one request/response exchange on an already-established conn.
 /// Factored out so both pool-hit and pool-miss paths share the same body.
-fn run_one_request<S: Read + Write>(conn: &mut Connection<S>, req: &Request) -> Result<Response> {
+fn run_one_request<S: Read + Write>(
+    conn: &mut Connection<S>,
+    req: &Request,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let stream_id = conn.open_stream()?;
+    // Trace the request `>` lines right before they go on the wire, so the
+    // trace reflects exactly what `send_request_on` is about to encode.
+    trace_request(req, trace);
     conn.send_request_on(stream_id, req)?;
+    if !req.body.is_empty() {
+        let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
+    }
     let stream = conn.drive_until_stream_done(stream_id)?;
     // Reap any other streams that completed while we were driving this one, so
     // a pooled connection's `streams` map doesn't grow across reuses.
     conn.prune_completed_streams();
-    build_response_from_stream(stream)
+    build_response_from_stream(stream, trace)
 }
 
 /// Translate a fully-received `Stream` into the public `Response` type.
 /// Extracts the `:status` pseudo-header, drops any other pseudo-headers
 /// (none are defined for responses but be conservative), and inherits the
 /// accumulated body.
-fn build_response_from_stream(stream: Stream) -> Result<Response> {
+fn build_response_from_stream(stream: Stream, trace: &mut dyn Write) -> Result<Response> {
     let headers = stream
         .response_headers
         .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
@@ -2594,10 +2593,21 @@ fn build_response_from_stream(stream: Stream) -> Result<Response> {
     }
     let status = status.ok_or_else(|| Error::BadResponse("response missing :status".into()))?;
 
+    // Response `<` trace, mirroring the HTTP/1.1 reader: a status line carrying
+    // the HTTP/2 version + numeric status, then each header field in received
+    // order (lowercase, as h2 delivers them), then a closing blank `< `.
+    let _ = writeln!(trace, "< HTTP/2 {status}");
+    for (k, v) in &clean_headers {
+        let _ = writeln!(trace, "< {k}: {v}");
+    }
+    let _ = writeln!(trace, "< ");
+
+    let wire_len = stream.body.len();
+    let _ = writeln!(trace, "* Received {wire_len} body bytes");
+
     // Shared with HTTP/1.1 and HTTP/3: peel off any `Content-Encoding`
     // layer rsurl knows how to decode (gzip / deflate / x-gzip / identity).
-    let (clean_headers, body) =
-        crate::http::maybe_decode_body(clean_headers, stream.body, &mut std::io::sink())?;
+    let (clean_headers, body) = crate::http::maybe_decode_body(clean_headers, stream.body, trace)?;
 
     Ok(Response {
         status,
@@ -2613,22 +2623,27 @@ fn build_response_from_stream(stream: Stream) -> Result<Response> {
 /// the connection-specific ones HTTP/2 forbids per §8.2.2). The `encoder`
 /// is borrowed mutably so its dynamic table tracks every header we emit
 /// with incremental indexing — keeping our table aligned with the peer's.
-fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
-    let mut out = Vec::new();
-
-    // Pseudo-headers must come first, in this order: :method, :scheme,
-    // :authority, :path.
-    encoder.encode_header(&mut out, ":method", &req.method);
-    encoder.encode_header(&mut out, ":scheme", &req.url.scheme);
+/// Compute the exact ordered list of header fields rsurl will put on the wire
+/// for `req`, split into the four pseudo-headers (`:method`, `:scheme`,
+/// `:authority`, `:path`) and the regular `(name, value)` fields that follow.
+///
+/// This is the single source of truth for what gets encoded into the HEADERS
+/// block, so the verbose `-v` trace can reproduce the request exactly without
+/// hardcoding (it reads the same list the encoder consumes).
+fn request_header_fields(req: &Request) -> (RequestPseudo, Vec<(String, String)>) {
     let authority = if req.url.port == 443 && req.url.scheme == "https" {
         req.url.host.clone()
     } else {
         format!("{}:{}", req.url.host, req.url.port)
     };
-    encoder.encode_header(&mut out, ":authority", &authority);
-    encoder.encode_header(&mut out, ":path", &req.url.path);
+    let pseudo = RequestPseudo {
+        method: req.method.clone(),
+        scheme: req.url.scheme.clone(),
+        authority,
+        path: req.url.path.clone(),
+    };
 
-    // Regular headers: lowercased name, skip any banned ones.
+    let mut fields: Vec<(String, String)> = Vec::new();
     let mut have_ua = false;
     let mut have_accept = false;
     let mut have_accept_enc = false;
@@ -2650,35 +2665,73 @@ fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
         if lk == "authorization" {
             have_auth = true;
         }
-        encoder.encode_header(&mut out, &lk, v);
+        fields.push((lk, v.clone()));
     }
     if !have_auth {
         if let Some(creds) = crate::http::effective_basic_auth(req) {
-            let value = format!("Basic {creds}");
-            encoder.encode_header(&mut out, "authorization", &value);
+            fields.push(("authorization".to_string(), format!("Basic {creds}")));
         }
     }
     if !have_ua {
-        encoder.encode_header(
-            &mut out,
-            "user-agent",
-            concat!("rsurl/", env!("CARGO_PKG_VERSION")),
-        );
+        fields.push((
+            "user-agent".to_string(),
+            concat!("rsurl/", env!("CARGO_PKG_VERSION")).to_string(),
+        ));
     }
     if !have_accept {
-        encoder.encode_header(&mut out, "accept", "*/*");
+        fields.push(("accept".to_string(), "*/*".to_string()));
     }
     if !have_accept_enc {
         // Same default as the HTTP/1.1 writer — rsurl always decodes these
         // on the way back (see `crate::compress`). The full value is HPACK
         // static index 16, so this round-trips with minimum bytes on wire.
-        encoder.encode_header(&mut out, "accept-encoding", "gzip, deflate");
+        fields.push(("accept-encoding".to_string(), "gzip, deflate".to_string()));
     }
     if !req.body.is_empty() {
-        let len = req.body.len().to_string();
-        encoder.encode_header(&mut out, "content-length", &len);
+        fields.push(("content-length".to_string(), req.body.len().to_string()));
+    }
+    (pseudo, fields)
+}
+
+/// The four HTTP/2 request pseudo-headers, in send order.
+struct RequestPseudo {
+    method: String,
+    scheme: String,
+    authority: String,
+    path: String,
+}
+
+fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (pseudo, fields) = request_header_fields(req);
+
+    // Pseudo-headers must come first, in this order: :method, :scheme,
+    // :authority, :path.
+    encoder.encode_header(&mut out, ":method", &pseudo.method);
+    encoder.encode_header(&mut out, ":scheme", &pseudo.scheme);
+    encoder.encode_header(&mut out, ":authority", &pseudo.authority);
+    encoder.encode_header(&mut out, ":path", &pseudo.path);
+
+    // Regular headers: lowercased name, banned ones already filtered out.
+    for (k, v) in &fields {
+        encoder.encode_header(&mut out, k, v);
     }
     out
+}
+
+/// Emit the curl-style `> ` request trace for an HTTP/2 request, mirroring the
+/// HTTP/1.1 writer's format: a request line, a `Host:` line synthesised from
+/// `:authority`, then each regular header field, then a closing blank `> `.
+/// Reads from [`request_header_fields`] so the trace reflects exactly what the
+/// HEADERS block carries.
+fn trace_request(req: &Request, trace: &mut dyn Write) {
+    let (pseudo, fields) = request_header_fields(req);
+    let _ = writeln!(trace, "> {} {} HTTP/2", pseudo.method, pseudo.path);
+    let _ = writeln!(trace, "> Host: {}", pseudo.authority);
+    for (k, v) in &fields {
+        let _ = writeln!(trace, "> {k}: {v}");
+    }
+    let _ = writeln!(trace, "> ");
 }
 
 fn is_connection_specific_header(name: &str) -> bool {
@@ -4279,7 +4332,7 @@ mod tests {
 
         // Request #1 → stream 1.
         assert_eq!(conn.next_stream_id, 1);
-        let r1 = run_one_request(&mut conn, &req).unwrap();
+        let r1 = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap();
         assert_eq!(r1.status, 200);
         assert_eq!(r1.body, b"first");
         // Stream pruned, conn ready for the next id, still poolable.
@@ -4288,7 +4341,7 @@ mod tests {
         assert!(conn.is_usable());
 
         // Request #2 → stream 3.
-        let r2 = run_one_request(&mut conn, &req).unwrap();
+        let r2 = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap();
         assert_eq!(r2.status, 200);
         assert_eq!(r2.body, b"second");
         assert!(conn.streams.is_empty());
@@ -4296,7 +4349,7 @@ mod tests {
         assert!(conn.is_usable());
 
         // Request #3 → stream 5.
-        let r3 = run_one_request(&mut conn, &req).unwrap();
+        let r3 = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap();
         assert_eq!(r3.body, b"third");
         assert_eq!(conn.next_stream_id, 7);
         assert!(conn.is_usable());
@@ -4310,6 +4363,61 @@ mod tests {
             .map(|f| f.stream_id)
             .collect();
         assert_eq!(header_ids, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn run_one_request_emits_curl_style_verbose_trace() {
+        // Server response: HEADERS(:status 200, content-type: text/plain)
+        // then DATA("hello world", END_STREAM). Drive one request through
+        // `run_one_request` with a `Vec<u8>` trace sink and assert it carries
+        // the curl-style `>` request lines, the `< HTTP/2 200` status line,
+        // the response header line, and the `* Received N body bytes` line.
+        let mut hdr_payload = Vec::new();
+        let mut enc = Encoder::new();
+        enc.encode_header(&mut hdr_payload, ":status", "200");
+        enc.encode_header(&mut hdr_payload, "content-type", "text/plain");
+        let headers_frame = Frame {
+            typ: F_HEADERS,
+            flags: FLAG_END_HEADERS,
+            stream_id: 1,
+            payload: hdr_payload,
+        };
+        let inbound = vec![headers_frame, synth_data(1, b"hello world", true)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+
+        let req = h2_get("https://example.com/path");
+        let mut trace: Vec<u8> = Vec::new();
+        let resp = run_one_request(&mut conn, &req, &mut trace).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello world");
+
+        let t = String::from_utf8(trace).expect("trace is utf-8");
+        // Request line + a synthesised Host line + a default header field.
+        assert!(
+            t.contains("> GET /path HTTP/2"),
+            "missing request line in trace:\n{t}"
+        );
+        assert!(
+            t.contains("> Host: example.com"),
+            "missing Host line in trace:\n{t}"
+        );
+        assert!(
+            t.contains("> accept: */*"),
+            "missing default accept header in trace:\n{t}"
+        );
+        // Response status + header + body-byte notice.
+        assert!(
+            t.contains("< HTTP/2 200"),
+            "missing response status line in trace:\n{t}"
+        );
+        assert!(
+            t.contains("< content-type: text/plain"),
+            "missing response header line in trace:\n{t}"
+        );
+        assert!(
+            t.contains("* Received 11 body bytes"),
+            "missing received-bytes notice in trace:\n{t}"
+        );
     }
 
     #[test]
@@ -4332,7 +4440,7 @@ mod tests {
         let mut conn = fake_conn_with_inbound(&inbound);
 
         let req = h2_get("https://example.com/");
-        let r1 = run_one_request(&mut conn, &req).unwrap();
+        let r1 = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap();
         assert_eq!(r1.body, b"ok");
         assert!(conn.is_usable(), "no GOAWAY seen yet — still reusable");
 

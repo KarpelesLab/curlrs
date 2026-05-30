@@ -689,11 +689,11 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     match req.http_version_pref {
         HttpVersionPref::Http2Only => {
             let _ = writeln!(trace, "* HTTP/2 required (--http2)");
-            return crate::http2::send(req);
+            return crate::http2::send(req, trace);
         }
         HttpVersionPref::Auto => {
             let _ = writeln!(trace, "* Trying HTTP/2 via ALPN (h2)");
-            match crate::http2::send(req.clone()) {
+            match crate::http2::send(req.clone(), trace) {
                 Ok(resp) => return Ok(resp),
                 Err(Error::H2NotNegotiated) => {
                     let _ = writeln!(
@@ -799,7 +799,7 @@ fn finalize_tls(
 /// [`connect_tunnel`] on the returned socket before any TLS handshake.
 /// This function intentionally stops at "TCP connected" so that the
 /// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
-fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
+pub(crate) fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
     let proxy = req.proxy.as_ref().filter(|_| !proxy_bypassed(req));
     let (target_host, target_port, via_proxy_label) = match proxy {
         Some(p) => (p.host.as_str(), p.port, true),
@@ -935,7 +935,10 @@ pub(crate) fn connect_tunnel<S: Read + Write>(
     Ok(())
 }
 
-fn write_tls_info<S: Read + Write>(tls: &crate::tls::TlsStream<S>, trace: &mut dyn Write) {
+pub(crate) fn write_tls_info<S: Read + Write>(
+    tls: &crate::tls::TlsStream<S>,
+    trace: &mut dyn Write,
+) {
     if let Some(v) = tls.negotiated_version() {
         let _ = writeln!(trace, "* SSL connection using {v:?}");
     }
