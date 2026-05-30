@@ -419,10 +419,15 @@ pub(crate) mod qpack {
             let (nlen, used) = decode_int(b0, 5, &buf[1..])?;
             let mut p = 1 + used;
             let nlen = nlen as usize;
-            if p + nlen > buf.len() {
+            // A length that overflows usize can never be satisfied by more
+            // bytes; treat it as a hard error rather than an endless "need more".
+            let nend = p.checked_add(nlen).ok_or_else(|| {
+                Error::BadResponse("qpack: oversized encoder literal name length".into())
+            })?;
+            if nend > buf.len() {
                 return Ok(None);
             }
-            let name = decode_string_bytes(&buf[p..p + nlen], huffman, "encoder literal name")?;
+            let name = decode_string_bytes(&buf[p..nend], huffman, "encoder literal name")?;
             p += nlen;
             let (value, vlen) = match try_decode_literal_string_7bit(&buf[p..])? {
                 Some(x) => x,
@@ -490,7 +495,11 @@ pub(crate) mod qpack {
             None => return Ok(None),
         };
         let start = 1 + used;
-        let end = start + slen as usize;
+        // A length that overflows usize cannot ever be satisfied by more bytes;
+        // treat it as a hard error rather than an endless "need more".
+        let end = start.checked_add(slen as usize).ok_or_else(|| {
+            Error::BadResponse("qpack: oversized literal string length".into())
+        })?;
         if end > buf.len() {
             return Ok(None);
         }
@@ -931,10 +940,10 @@ pub(crate) mod qpack {
                 let (nlen, used) = decode_int(b, 3, &buf[p + 1..])?;
                 p += 1 + used;
                 let nlen = nlen as usize;
-                if p + nlen > buf.len() {
-                    return Err(Error::BadResponse("qpack: truncated literal name".into()));
-                }
-                let name = decode_string_bytes(&buf[p..p + nlen], huffman, "literal name")?;
+                let nend = p.checked_add(nlen).filter(|&e| e <= buf.len()).ok_or_else(|| {
+                    Error::BadResponse("qpack: truncated/oversized literal name".into())
+                })?;
+                let name = decode_string_bytes(&buf[p..nend], huffman, "literal name")?;
                 p += nlen;
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
@@ -1001,10 +1010,12 @@ pub(crate) mod qpack {
         let huffman = b & 0b1000_0000 != 0;
         let (slen, used) = decode_int(b, 7, &buf[1..])?;
         let start = 1 + used;
-        let end = start + slen as usize;
-        if end > buf.len() {
-            return Err(Error::BadResponse("qpack: truncated literal value".into()));
-        }
+        let end = start
+            .checked_add(slen as usize)
+            .filter(|&e| e <= buf.len())
+            .ok_or_else(|| {
+                Error::BadResponse("qpack: truncated/oversized literal value".into())
+            })?;
         let raw = &buf[start..end];
         let s = if huffman {
             let bytes = huffman_decode(raw)?;
@@ -2406,6 +2417,42 @@ mod tests {
             fields,
             vec![("custom-key".to_string(), "custom-value".to_string())]
         );
+    }
+
+    #[test]
+    fn qpack_oversized_literal_value_length_does_not_panic() {
+        // Regression: an attacker-controlled literal-value length close to
+        // usize::MAX must not overflow `start + slen` (which in release builds
+        // wraps past the `end > buf.len()` guard and panics on the slice).
+        // The decoder must return a hard error instead.
+        let mut buf = Vec::new();
+        // Field-section prefix: RIC=0, Base=0.
+        enc_prefix(0, false, 0, &mut buf);
+        // Literal Field Line With Literal Name, H=0, name length 1.
+        qpack::encode_int(1, 3, 0b0010_0000, &mut buf);
+        buf.push(b'a'); // 1-byte literal name
+        // Value: 7-bit prefix, H=0, length = u64::MAX - 1 (won't overflow the
+        // qpack-int decoder, but `start + slen as usize` would wrap usize).
+        qpack::encode_int(u64::MAX - 1, 7, 0x00, &mut buf);
+        // No value bytes follow.
+        let t = table_at_max();
+        let err = qpack::decode_field_section_with(&buf, &t).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn qpack_encoder_oversized_literal_name_length_does_not_panic() {
+        // Regression: the streaming encoder-stream parser must not overflow
+        // `p + nlen` for an Insert With Literal Name whose name length is near
+        // usize::MAX. An unsatisfiable (overflowing) length is a hard error,
+        // not an endless "need more bytes".
+        let mut wire = Vec::new();
+        // Insert With Literal Name (§4.3.3): 01 H nnnnn, H=0, 5-bit name len.
+        qpack::encode_int(u64::MAX - 1, 5, 0b0100_0000, &mut wire);
+        // No name bytes follow.
+        let mut t = table_at_max();
+        let err = qpack::apply_encoder_instructions(&mut t, &wire).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
     }
 
     #[test]
